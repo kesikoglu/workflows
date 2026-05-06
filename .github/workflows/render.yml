@@ -38,8 +38,7 @@ jobs:
         run: |
           mkdir -p audio_files
           python3 << 'EOF'
-          import json, urllib.request, sys
-
+          import json, urllib.request
           urls = json.loads('${{ inputs.audio_urls }}')
           print(f"Downloading {len(urls)} audio files...")
           for i, url in enumerate(urls):
@@ -56,19 +55,17 @@ jobs:
           print('Cover downloaded.')
           "
 
-      - name: Prepare cover (1920x1080)
+      - name: Prepare cover 1920x1080
         run: |
           ffmpeg -i cover_raw.jpg \
             -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1" \
             cover_hd.jpg
-          echo "Cover prepared."
 
       - name: Build FFmpeg concat list
         run: |
           ls audio_files/track_*.mp3 | sort | while read f; do
             echo "file '../$f'"
           done > concat_list.txt
-          echo "Concat list:"
           cat concat_list.txt
 
       - name: Concatenate all audio
@@ -78,7 +75,7 @@ jobs:
           echo "Total duration: ${DURATION}s"
           echo "AUDIO_DURATION=${DURATION}" >> $GITHUB_ENV
 
-      - name: Render video (image + audio → MP4)
+      - name: Render video
         run: |
           ffmpeg \
             -loop 1 -framerate 1 -i cover_hd.jpg \
@@ -90,7 +87,6 @@ jobs:
             -movflags +faststart \
             output.mp4
           ls -lh output.mp4
-          echo "Render complete."
 
       - name: Upload to YouTube
         env:
@@ -101,7 +97,6 @@ jobs:
           python3 << 'EOF'
           import os, json, requests
 
-          # Get access token
           r = requests.post("https://oauth2.googleapis.com/token", data={
             "client_id":     os.environ["YT_CLIENT_ID"],
             "client_secret": os.environ["YT_CLIENT_SECRET"],
@@ -110,23 +105,17 @@ jobs:
           })
           access_token = r.json()["access_token"]
 
-          title       = "${{ inputs.video_title }}"
-          description = "${{ inputs.youtube_description }}"
-          tags_raw    = "${{ inputs.youtube_tags }}"
-          tags        = [t.strip() for t in tags_raw.split(",")]
-
-          # Initiate resumable upload
           meta = {
             "snippet": {
-              "title": title,
-              "description": description,
-              "tags": tags,
-              "categoryId": "10"   # Music category
+              "title":       "${{ inputs.video_title }}",
+              "description": "${{ inputs.youtube_description }}",
+              "tags":        [t.strip() for t in "${{ inputs.youtube_tags }}".split(",")],
+              "categoryId":  "10"
             },
             "status": { "privacyStatus": "public" }
           }
 
-          init_resp = requests.post(
+          init = requests.post(
             "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
             headers={
               "Authorization": f"Bearer {access_token}",
@@ -135,12 +124,11 @@ jobs:
             },
             data=json.dumps(meta)
           )
-          upload_url = init_resp.headers["Location"]
+          upload_url = init.headers["Location"]
 
-          # Upload file in chunks
-          file_size = os.path.getsize("output.mp4")
-          chunk_size = 50 * 1024 * 1024  # 50 MB chunks
-          uploaded = 0
+          file_size  = os.path.getsize("output.mp4")
+          chunk_size = 50 * 1024 * 1024
+          uploaded   = 0
 
           with open("output.mp4", "rb") as f:
             while uploaded < file_size:
@@ -156,8 +144,8 @@ jobs:
                 data=chunk
               )
               uploaded += len(chunk)
-              print(f"Uploaded {uploaded}/{file_size} bytes ({100*uploaded//file_size}%)")
+              print(f"Uploaded {uploaded}/{file_size} ({100*uploaded//file_size}%)")
 
           video_id = resp.json().get("id", "unknown")
-          print(f"✅ YouTube upload complete! https://youtube.com/watch?v={video_id}")
+          print(f"Done! https://youtube.com/watch?v={video_id}")
           EOF
