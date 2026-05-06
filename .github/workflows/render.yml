@@ -36,16 +36,22 @@ jobs:
 
       - name: Download all audio files
         run: |
-          mkdir -p audio_files
-          python3 << 'EOF'
-          import json, urllib.request
-          urls = json.loads('${{ inputs.audio_urls }}')
-          print(f"Downloading {len(urls)} audio files...")
-          for i, url in enumerate(urls):
-              dest = f"audio_files/track_{i:04d}.mp3"
-              urllib.request.urlretrieve(url, dest)
-              print(f"  [{i+1}/{len(urls)}] {dest}")
-          EOF
+         mkdir -p audio_files
+         python3 << 'EOF'
+         import json, requests
+
+         urls = json.loads('${{ inputs.audio_urls }}')
+         headers = {"User-Agent": "Mozilla/5.0 (compatible; MusicPipeline/1.0)"}
+         print(f"Downloading {len(urls)} audio files...")
+         for i, url in enumerate(urls):
+            dest = f"audio_files/track_{i:04d}.mp3"
+            r = requests.get(url, headers=headers, stream=True, timeout=120)
+            r.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            print(f" [{i+1}/{len(urls)}] {dest}")
+         EOF
 
       - name: Download cover image
         run: |
