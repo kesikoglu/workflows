@@ -66,7 +66,7 @@ jobs:
           ffmpeg -i cover_raw.jpg \
             -vf "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,setsar=1" \
             cover_hd.jpg
-          
+
       - name: Build FFmpeg concat list
         run: |
           ls audio_files/track_*.mp3 | sort | while read f; do
@@ -95,6 +95,7 @@ jobs:
           ls -lh output.mp4
 
       - name: Upload to YouTube
+        id: youtube_upload
         env:
           YT_CLIENT_ID:     ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
@@ -156,4 +157,24 @@ jobs:
 
           video_id = resp.json().get("id", "unknown")
           print(f"Done! https://youtube.com/watch?v={video_id}")
+
+          # GitHub Actions output'a yaz — sonraki step okuyacak
+          gh_output = os.environ.get("GITHUB_OUTPUT", "")
+          if gh_output:
+              with open(gh_output, "a") as fh:
+                  fh.write(f"video_id={video_id}\n")
           EOF
+
+      - name: Notify n8n — YouTube Complete
+        if: always()
+        run: |
+          VIDEO_ID="${{ steps.youtube_upload.outputs.video_id }}"
+          echo "VIDEO_ID: $VIDEO_ID"
+          if [ -n "$VIDEO_ID" ] && [ "$VIDEO_ID" != "unknown" ]; then
+            curl -s -X POST "https://n8n-production-eefc3.up.railway.app/webhook/youtube-complete" \
+              -H "Content-Type: application/json" \
+              -d "{\"session_id\": \"${{ inputs.session_id }}\", \"youtube_id\": \"$VIDEO_ID\"}"
+            echo "n8n callback gönderildi."
+          else
+            echo "VIDEO_ID bulunamadı, callback atlandı."
+          fi
