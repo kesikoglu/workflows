@@ -109,7 +109,9 @@ jobs:
             "refresh_token": os.environ["YT_REFRESH_TOKEN"],
             "grant_type":    "refresh_token"
           })
-          access_token = r.json()["access_token"]
+          resp_data = r.json()
+          print("OAuth response:", resp_data)
+          access_token = resp_data["access_token"]
 
           meta = {
             "snippet": {
