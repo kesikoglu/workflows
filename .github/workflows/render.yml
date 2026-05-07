@@ -70,7 +70,7 @@ jobs:
       - name: Build FFmpeg concat list
         run: |
           ls audio_files/track_*.mp3 | sort | while read f; do
-            echo "file '../$f'"
+            echo "file '$f'"
           done > concat_list.txt
           cat concat_list.txt
 
