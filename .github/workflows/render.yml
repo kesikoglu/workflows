@@ -64,9 +64,9 @@ jobs:
       - name: Prepare cover 1920x1080
         run: |
           ffmpeg -i cover_raw.jpg \
-            -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1" \
+            -vf "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,setsar=1" \
             cover_hd.jpg
-
+          
       - name: Build FFmpeg concat list
         run: |
           ls audio_files/track_*.mp3 | sort | while read f; do
