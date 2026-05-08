@@ -100,6 +100,9 @@ jobs:
           YT_CLIENT_ID:     ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          YT_TITLE:       ${{ inputs.video_title }}
+          YT_DESCRIPTION: ${{ inputs.youtube_description }}
+          YT_TAGS:        ${{ inputs.youtube_tags }}
         run: |
           python3 << 'EOF'
           import os, json, requests
@@ -116,9 +119,9 @@ jobs:
 
           meta = {
             "snippet": {
-              "title":       "${{ inputs.video_title }}",
-              "description": "${{ inputs.youtube_description }}",
-              "tags":        [t.strip() for t in "${{ inputs.youtube_tags }}".split(",")],
+              "title":       os.environ["YT_TITLE"],
+              "description": os.environ["YT_DESCRIPTION"],
+              "tags":        [t.strip() for t in os.environ["YT_TAGS"].split(",")],
               "categoryId":  "10"
             },
             "status": { "privacyStatus": "public" }
