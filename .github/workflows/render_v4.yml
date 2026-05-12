@@ -153,106 +153,33 @@ jobs:
           ffmpeg             -loop 1 -framerate 1 -i cover_hd.jpg             -i merged_audio.mp3             -c:v libx264 -tune stillimage -preset slow             -c:a aac -b:a 192k             -pix_fmt yuv420p             -t "${{ env.AUDIO_DURATION }}"             -movflags +faststart             output.mp4
           ls -lh output.mp4
 
-      # ── Shorts: ses ritmi analiz et → pulse zoom efekti ──
-      - name: Render Shorts video (portrait, 59s + beat pulse)
+      # ── Shorts: Ken Burns efekti (zarif zoom + pan) ──
+      - name: Render Shorts video (portrait, 59s + Ken Burns)
         run: |
           python3 << 'EOF'
-          import subprocess, json, math, os
+          import subprocess, os
 
-          # 1. İlk 59 saniyelik ses seviyesini analiz et (her 0.1s'de bir)
-          result = subprocess.run([
-              "ffprobe", "-v", "quiet",
-              "-select_streams", "a:0",
-              "-show_frames",
-              "-read_intervals", "%+59",
-              "-of", "json",
-              "-f", "lavfi",
-              "amovie=merged_audio.mp3,astats=metadata=1:reset=1",
-          ], capture_output=True, text=True)
+          fps = 25
+          duration = 59
+          total_frames = fps * duration  # 1475
 
-          # 2. Ses seviyesini ffmpeg volumedetect ile al (daha basit)
-          vol_result = subprocess.run([
-              "ffmpeg", "-i", "merged_audio.mp3",
-              "-t", "59",
-              "-af", "astats=metadata=1:reset=100ms,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=/tmp/rms.txt",
-              "-f", "null", "-"
-          ], capture_output=True, text=True)
+          # Ken Burns: yavaş zoom 1.0 → 1.08, hafif pan sol→sağ
+          # zoompan filter: d=toplam frame, s=çıkış boyutu
+          # z: zoom formülü (lineer artış)
+          # x: pan formülü (soldan sağa hafif kayma)
+          # y: dikey orta sabit
+          zoom_expr   = f"'min(1+on/{total_frames}*0.08,1.08)'"
+          pan_x_expr  = f"'iw/2-(iw/zoom/2)+on/{total_frames}*20'"
+          pan_y_expr  = "'ih/2-(ih/zoom/2)'"
 
-          # 3. RMS değerlerini oku ve normalize et
-          rms_values = []
-          try:
-              with open("/tmp/rms.txt") as f:
-                  for line in f:
-                      line = line.strip()
-                      if "=" in line:
-                          val = line.split("=")[-1].strip()
-                          try:
-                              db = float(val)
-                              if db > -100:
-                                  rms_values.append(db)
-                          except:
-                              pass
-          except:
-              pass
+          vf = (
+              f"[0:v]scale=2160:3840,"
+              f"zoompan=z={zoom_expr}:x={pan_x_expr}:y={pan_y_expr}"
+              f":d={total_frames}:s=1080x1920:fps={fps}[v]"
+          )
 
-          print(f"RMS sample sayisi: {len(rms_values)}")
-
-          if len(rms_values) < 5:
-              print("Yeterli RMS verisi yok, sabit zoom kullaniliyor...")
-              # Fallback: basit Ken Burns zoom
-              subprocess.run([
-                  "ffmpeg",
-                  "-loop", "1", "-framerate", "25", "-i", "cover_portrait.jpg",
-                  "-i", "merged_audio.mp3",
-                  "-filter_complex",
-                  "[0:v]scale=1080:1920,zoompan=z='min(zoom+0.0005,1.05)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1475:s=1080x1920:fps=25[v]",
-                  "-map", "[v]", "-map", "1:a",
-                  "-c:v", "libx264", "-preset", "slow",
-                  "-c:a", "aac", "-b:a", "192k",
-                  "-pix_fmt", "yuv420p",
-                  "-t", "59",
-                  "-movflags", "+faststart",
-                  "output_shorts.mp4"
-              ], check=True)
-          else:
-              # 4. Normalize: -60dB → 1.0, 0dB → 1.08 (max zoom)
-              min_db = max(min(rms_values), -60)
-              max_db = max(rms_values)
-              db_range = max(max_db - min_db, 1)
-
-              # Her frame için zoom değeri üret (25fps, 59s = 1475 frame)
-              fps = 25
-              total_frames = 59 * fps
-              samples_per_frame = len(rms_values) / total_frames
-
-              zoom_expr_parts = []
-              for i in range(total_frames):
-                  rms_idx = min(int(i * samples_per_frame), len(rms_values) - 1)
-                  db = rms_values[rms_idx]
-                  # Normalize 1.0 - 1.08
-                  norm = (db - min_db) / db_range
-                  zoom = 1.0 + (norm * 0.08)
-                  zoom = round(zoom, 4)
-                  zoom_expr_parts.append(zoom)
-
-              # FFmpeg zoompan için smooth expression oluştur
-              # Uzun expression yerine ortalama + sin wave kullan (daha stabil)
-              avg_zoom = sum(zoom_expr_parts) / len(zoom_expr_parts)
-              amplitude = (max(zoom_expr_parts) - min(zoom_expr_parts)) / 2
-              amplitude = min(amplitude, 0.05)  # Max %5 zoom değişim
-
-              print(f"Zoom avg: {avg_zoom:.4f}, amplitude: {amplitude:.4f}")
-
-              # zoompan: ritme göre sin wave pulse
-              # n = frame numarası, fps=25, beat ~0.5-2Hz arası
-              zoom_expr = f"'min(max({avg_zoom:.4f}+{amplitude:.4f}*sin(2*PI*n/{fps}*1.5),1.0),1.1)'"
-              pan_x = "iw/2-(iw/zoom/2)"
-              pan_y = "ih/2-(ih/zoom/2)"
-
-              vf = f"[0:v]scale=2160:3840,zoompan=z={zoom_expr}:x='{pan_x}':y='{pan_y}':d=1:s=1080x1920:fps={fps},scale=1080:1920[v]"
-
-              print("FFmpeg Shorts render basliyor (beat pulse)...")
-              subprocess.run([
+          print("Ken Burns Shorts render basliyor...")
+          subprocess.run([
                   "ffmpeg",
                   "-loop", "1", "-framerate", str(fps), "-i", "cover_portrait.jpg",
                   "-i", "merged_audio.mp3",
@@ -370,7 +297,7 @@ jobs:
           # Shorts baslik: maks 70 karakter + #Shorts
           short_title = base_title[:70] + " #Shorts"
 
-          # Aciklama: ana videoya link
+          # Aciklama: ana videoya link + kanal mention
           full_video_line = (
               f"\n\n\U0001f3ac Full version: https://youtube.com/watch?v={main_video_id}"
               if main_video_id and main_video_id != "unknown" else ""
@@ -379,6 +306,7 @@ jobs:
               f"\U0001f3b5 {base_title}\n\n"
               "Relax, focus, and let the music flow. \u2728"
               f"{full_video_line}\n\n"
+              "\U0001f514 More music: @GoldenSunsetLoungeVibes\n\n"
               "#Shorts #RelaxingMusic #ChillVibes #LoFi #AmbientMusic"
           )
 
