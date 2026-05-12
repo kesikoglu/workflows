@@ -307,7 +307,7 @@ jobs:
           echo "VIDEO_ID: $VIDEO_ID"
           echo "SHORTS_ID: $SHORTS_ID"
           if [ -n "$VIDEO_ID" ] && [ "$VIDEO_ID" != "unknown" ]; then
-            curl -s -X POST "https://n8n-production-eefc3.up.railway.app/webhook/youtube-complete" \
+            curl -s -X POST "https://n8n-production-eefc3.up.railway.app/webhook/614ee79d-c73c-4b3d-87da-44f1abd76f4a" \
               -H "Content-Type: application/json" \
               -d "{\"session_id\": \"${{ inputs.session_id }}\", \"youtube_id\": \"$VIDEO_ID\", \"shorts_id\": \"$SHORTS_ID\"}"
             echo "n8n callback gonderildi."
