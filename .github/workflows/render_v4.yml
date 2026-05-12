@@ -22,7 +22,11 @@ on:
         description: 'Comma-separated tags'
         required: true
       shorts_cover_url:
-        description: 'shorts.jpg Drive URL (optional, empty = crop from cover)'
+        description: 'shorts.jpg Drive URL (optional, empty = Gemini ile portrait üret)'
+        required: false
+        default: ''
+      shorts_image_prompt:
+        description: 'Gemini için shorts görsel prompt (n8n den gelir)'
         required: false
         default: ''
 
@@ -36,7 +40,7 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y ffmpeg python3-pip
-          pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib requests
+          pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib requests numpy
 
       - name: Download all audio files
         run: |
@@ -67,32 +71,69 @@ jobs:
 
       - name: Prepare cover 1920x1080 (landscape)
         run: |
-          ffmpeg -i cover_raw.jpg \
-            -vf "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,setsar=1" \
-            cover_hd.jpg
+          ffmpeg -i cover_raw.jpg             -vf "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,setsar=1"             cover_hd.jpg
 
-      # ── Shorts kapak: shorts.jpg varsa onu kullan, yoksa cover_raw.jpg'den crop ──
-      - name: Prepare cover portrait (Shorts)
+      # ── Shorts kapak: manuel varsa onu kullan, yoksa Gemini ile 9:16 portrait üret ──
+      - name: Prepare Shorts cover portrait 1080x1920
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SHORTS_COVER_URL: ${{ inputs.shorts_cover_url }}
+          SHORTS_IMAGE_PROMPT: ${{ inputs.shorts_image_prompt }}
         run: |
-          SHORTS_URL="${{ inputs.shorts_cover_url }}"
-          if [ -n "$SHORTS_URL" ]; then
-            echo "shorts.jpg Drive URL bulundu, indiriliyor..."
-            python3 -c "
-          import urllib.request
-          urllib.request.urlretrieve('${SHORTS_URL}', 'shorts_raw.jpg')
-          print('shorts.jpg indirildi.')
-            "
-            ffmpeg -i shorts_raw.jpg \
-              -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1" \
-              cover_portrait.jpg
-            echo "shorts.jpg kullanildi."
-          else
-            echo "shorts.jpg yok, cover_raw.jpg merkez crop yapiliyor..."
-            ffmpeg -i cover_raw.jpg \
-              -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1" \
-              cover_portrait.jpg
-            echo "cover_raw.jpg crop kullanildi."
-          fi
+          python3 << 'EOF'
+          import os, requests, base64, json
+
+          shorts_url = os.environ.get("SHORTS_COVER_URL", "").strip()
+
+          if shorts_url:
+              print("Manuel shorts.jpg bulundu, indiriliyor...")
+              r = requests.get(shorts_url, timeout=60)
+              r.raise_for_status()
+              with open("shorts_raw.jpg", "wb") as f:
+                  f.write(r.content)
+              print("shorts.jpg indirildi.")
+              use_raw = "shorts_raw.jpg"
+          else:
+              print("shorts_cover_url bos, Gemini ile 9:16 portrait gorsel uretiliyor...")
+              prompt = os.environ.get("SHORTS_IMAGE_PROMPT", "").strip()
+              if not prompt:
+                  prompt = "A vertical portrait 9:16 cinematic music album cover art, atmospheric, moody lighting, suitable for YouTube Shorts, high quality digital art"
+
+              api_key = os.environ["GEMINI_API_KEY"]
+              url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview:generateContent?key={api_key}"
+              body = {
+                  "contents": [{"parts": [{"text": prompt}]}],
+                  "generationConfig": {
+                      "responseModalities": ["image", "text"],
+                      "imageGenerationConfig": {"aspectRatio": "9:16"}
+                  }
+              }
+              resp = requests.post(url, json=body, timeout=120)
+              resp.raise_for_status()
+              data = resp.json()
+              # Base64 resmi çıkar
+              img_b64 = None
+              for part in data["candidates"][0]["content"]["parts"]:
+                  if "inlineData" in part:
+                      img_b64 = part["inlineData"]["data"]
+                      break
+              if not img_b64:
+                  print("Gemini gorsel dondurmedi, cover_raw.jpg crop kullaniliyor...")
+                  use_raw = "cover_raw.jpg"
+              else:
+                  with open("shorts_raw.jpg", "wb") as f:
+                      f.write(base64.b64decode(img_b64))
+                  print("Gemini 9:16 portrait gorsel uretildi.")
+                  use_raw = "shorts_raw.jpg"
+
+          import subprocess
+          subprocess.run([
+              "ffmpeg", "-i", use_raw,
+              "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
+              "cover_portrait.jpg"
+          ], check=True)
+          print("cover_portrait.jpg hazir.")
+          EOF
 
       - name: Build FFmpeg concat list
         run: |
@@ -110,29 +151,125 @@ jobs:
 
       - name: Render video (landscape)
         run: |
-          ffmpeg \
-            -loop 1 -framerate 1 -i cover_hd.jpg \
-            -i merged_audio.mp3 \
-            -c:v libx264 -tune stillimage -preset slow \
-            -c:a aac -b:a 192k \
-            -pix_fmt yuv420p \
-            -t "${{ env.AUDIO_DURATION }}" \
-            -movflags +faststart \
-            output.mp4
+          ffmpeg             -loop 1 -framerate 1 -i cover_hd.jpg             -i merged_audio.mp3             -c:v libx264 -tune stillimage -preset slow             -c:a aac -b:a 192k             -pix_fmt yuv420p             -t "${{ env.AUDIO_DURATION }}"             -movflags +faststart             output.mp4
           ls -lh output.mp4
 
-      - name: Render Shorts video (portrait, 59s)
+      # ── Shorts: ses ritmi analiz et → pulse zoom efekti ──
+      - name: Render Shorts video (portrait, 59s + beat pulse)
         run: |
-          ffmpeg \
-            -loop 1 -framerate 1 -i cover_portrait.jpg \
-            -i merged_audio.mp3 \
-            -c:v libx264 -tune stillimage -preset slow \
-            -c:a aac -b:a 192k \
-            -pix_fmt yuv420p \
-            -t 59 \
-            -movflags +faststart \
-            output_shorts.mp4
-          ls -lh output_shorts.mp4
+          python3 << 'EOF'
+          import subprocess, json, math, os
+
+          # 1. İlk 59 saniyelik ses seviyesini analiz et (her 0.1s'de bir)
+          result = subprocess.run([
+              "ffprobe", "-v", "quiet",
+              "-select_streams", "a:0",
+              "-show_frames",
+              "-read_intervals", "%+59",
+              "-of", "json",
+              "-f", "lavfi",
+              "amovie=merged_audio.mp3,astats=metadata=1:reset=1",
+          ], capture_output=True, text=True)
+
+          # 2. Ses seviyesini ffmpeg volumedetect ile al (daha basit)
+          vol_result = subprocess.run([
+              "ffmpeg", "-i", "merged_audio.mp3",
+              "-t", "59",
+              "-af", "astats=metadata=1:reset=100ms,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=/tmp/rms.txt",
+              "-f", "null", "-"
+          ], capture_output=True, text=True)
+
+          # 3. RMS değerlerini oku ve normalize et
+          rms_values = []
+          try:
+              with open("/tmp/rms.txt") as f:
+                  for line in f:
+                      line = line.strip()
+                      if "=" in line:
+                          val = line.split("=")[-1].strip()
+                          try:
+                              db = float(val)
+                              if db > -100:
+                                  rms_values.append(db)
+                          except:
+                              pass
+          except:
+              pass
+
+          print(f"RMS sample sayisi: {len(rms_values)}")
+
+          if len(rms_values) < 5:
+              print("Yeterli RMS verisi yok, sabit zoom kullaniliyor...")
+              # Fallback: basit Ken Burns zoom
+              subprocess.run([
+                  "ffmpeg",
+                  "-loop", "1", "-framerate", "25", "-i", "cover_portrait.jpg",
+                  "-i", "merged_audio.mp3",
+                  "-filter_complex",
+                  "[0:v]scale=1080:1920,zoompan=z='min(zoom+0.0005,1.05)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1475:s=1080x1920:fps=25[v]",
+                  "-map", "[v]", "-map", "1:a",
+                  "-c:v", "libx264", "-preset", "slow",
+                  "-c:a", "aac", "-b:a", "192k",
+                  "-pix_fmt", "yuv420p",
+                  "-t", "59",
+                  "-movflags", "+faststart",
+                  "output_shorts.mp4"
+              ], check=True)
+          else:
+              # 4. Normalize: -60dB → 1.0, 0dB → 1.08 (max zoom)
+              min_db = max(min(rms_values), -60)
+              max_db = max(rms_values)
+              db_range = max(max_db - min_db, 1)
+
+              # Her frame için zoom değeri üret (25fps, 59s = 1475 frame)
+              fps = 25
+              total_frames = 59 * fps
+              samples_per_frame = len(rms_values) / total_frames
+
+              zoom_expr_parts = []
+              for i in range(total_frames):
+                  rms_idx = min(int(i * samples_per_frame), len(rms_values) - 1)
+                  db = rms_values[rms_idx]
+                  # Normalize 1.0 - 1.08
+                  norm = (db - min_db) / db_range
+                  zoom = 1.0 + (norm * 0.08)
+                  zoom = round(zoom, 4)
+                  zoom_expr_parts.append(zoom)
+
+              # FFmpeg zoompan için smooth expression oluştur
+              # Uzun expression yerine ortalama + sin wave kullan (daha stabil)
+              avg_zoom = sum(zoom_expr_parts) / len(zoom_expr_parts)
+              amplitude = (max(zoom_expr_parts) - min(zoom_expr_parts)) / 2
+              amplitude = min(amplitude, 0.05)  # Max %5 zoom değişim
+
+              print(f"Zoom avg: {avg_zoom:.4f}, amplitude: {amplitude:.4f}")
+
+              # zoompan: ritme göre sin wave pulse
+              # n = frame numarası, fps=25, beat ~0.5-2Hz arası
+              zoom_expr = f"'min(max({avg_zoom:.4f}+{amplitude:.4f}*sin(2*PI*n/{fps}*1.5),1.0),1.1)'"
+              pan_x = "iw/2-(iw/zoom/2)"
+              pan_y = "ih/2-(ih/zoom/2)"
+
+              vf = f"[0:v]scale=2160:3840,zoompan=z={zoom_expr}:x='{pan_x}':y='{pan_y}':d=1:s=1080x1920:fps={fps},scale=1080:1920[v]"
+
+              print("FFmpeg Shorts render basliyor (beat pulse)...")
+              subprocess.run([
+                  "ffmpeg",
+                  "-loop", "1", "-framerate", str(fps), "-i", "cover_portrait.jpg",
+                  "-i", "merged_audio.mp3",
+                  "-filter_complex", vf,
+                  "-map", "[v]", "-map", "1:a",
+                  "-c:v", "libx264", "-preset", "slow",
+                  "-c:a", "aac", "-b:a", "192k",
+                  "-pix_fmt", "yuv420p",
+                  "-t", "59",
+                  "-movflags", "+faststart",
+                  "output_shorts.mp4"
+              ], check=True)
+
+          size = os.path.getsize("output_shorts.mp4")
+          print(f"output_shorts.mp4 hazir: {size/1024/1024:.1f} MB")
+          EOF
 
       - name: Upload to YouTube (long form)
         id: youtube_upload
