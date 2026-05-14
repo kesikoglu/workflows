@@ -26,7 +26,11 @@ on:
         required: false
         default: '[]'
       shorts_cover_url:
-        description: 'shorts.jpg Drive URL (optional, empty = crop from cover)'
+        description: 'shorts.jpg Drive URL (optional, empty = Gemini ile portrait üret)'
+        required: false
+        default: ''
+      shorts_image_prompt:
+        description: 'Gemini için shorts görsel prompt (n8n den gelir)'
         required: false
         default: ''
 
@@ -75,27 +79,64 @@ jobs:
             -vf "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,setsar=1" \
             cover_hd.jpg
 
-      - name: Prepare cover portrait 1080x1920 (Shorts)
+      # ── Shorts kapak: manuel varsa onu kullan, yoksa Gemini ile 9:16 portrait üret ──
+      - name: Prepare Shorts cover portrait 1080x1920
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SHORTS_COVER_URL: ${{ inputs.shorts_cover_url }}
+          SHORTS_IMAGE_PROMPT: ${{ inputs.shorts_image_prompt }}
         run: |
-          SHORTS_URL="${{ inputs.shorts_cover_url }}"
-          if [ -n "$SHORTS_URL" ]; then
-            echo "shorts.jpg Drive URL bulundu, indiriliyor..."
-            python3 -c "
-          import urllib.request
-          urllib.request.urlretrieve('${SHORTS_URL}', 'shorts_raw.jpg')
-          print('shorts.jpg indirildi.')
-            "
-            ffmpeg -i shorts_raw.jpg \
-              -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1" \
-              cover_portrait.jpg
-            echo "shorts.jpg kullanildi."
-          else
-            echo "shorts.jpg yok, cover_raw.jpg merkez crop yapiliyor..."
-            ffmpeg -i cover_raw.jpg \
-              -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1" \
-              cover_portrait.jpg
-            echo "cover_raw.jpg crop kullanildi."
-          fi
+          python3 << 'EOF'
+          import os, requests, base64, json, subprocess
+
+          shorts_url = os.environ.get("SHORTS_COVER_URL", "").strip()
+
+          if shorts_url:
+              print("Manuel shorts.jpg bulundu, indiriliyor...")
+              r = requests.get(shorts_url, timeout=60)
+              r.raise_for_status()
+              with open("shorts_raw.jpg", "wb") as f:
+                  f.write(r.content)
+              print("shorts.jpg indirildi.")
+              use_raw = "shorts_raw.jpg"
+          else:
+              print("shorts_cover_url bos, Gemini ile 9:16 portrait gorsel uretiliyor...")
+              prompt = os.environ.get("SHORTS_IMAGE_PROMPT", "").strip()
+              if not prompt:
+                  prompt = "A vertical portrait 9:16 cinematic music album cover art, atmospheric, moody lighting, suitable for YouTube Shorts, high quality digital art"
+
+              api_key = os.environ["GEMINI_API_KEY"]
+              url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-preview-image-generation:generateContent?key={api_key}"
+              body = {
+                  "contents": [{"parts": [{"text": prompt}]}],
+                  "generationConfig": {"responseModalities": ["image", "text"]}
+              }
+              resp = requests.post(url, json=body, timeout=120)
+              resp.raise_for_status()
+              data = resp.json()
+
+              img_b64 = None
+              for part in data["candidates"][0]["content"]["parts"]:
+                  if "inlineData" in part:
+                      img_b64 = part["inlineData"]["data"]
+                      break
+
+              if not img_b64:
+                  print("Gemini gorsel dondurmedi, cover_raw.jpg crop kullaniliyor...")
+                  use_raw = "cover_raw.jpg"
+              else:
+                  with open("shorts_raw.jpg", "wb") as f:
+                      f.write(base64.b64decode(img_b64))
+                  print("Gemini 9:16 portrait gorsel uretildi.")
+                  use_raw = "shorts_raw.jpg"
+
+          subprocess.run([
+              "ffmpeg", "-i", use_raw,
+              "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
+              "cover_portrait.jpg"
+          ], check=True)
+          print("cover_portrait.jpg hazir.")
+          EOF
 
       - name: Build FFmpeg concat list
         run: |
@@ -152,6 +193,8 @@ jobs:
 
           print("=== TRACKLIST ===")
           print(tracklist)
+          print("=== FINAL DESCRIPTION ===")
+          print(final_desc[:500])
           EOF
 
       - name: Render video (landscape)
@@ -167,18 +210,45 @@ jobs:
             output.mp4
           ls -lh output.mp4
 
-      - name: Render Shorts video (portrait, 59s)
+      # ── Shorts: Ken Burns efekti (zarif zoom + pan) ──
+      - name: Render Shorts video (portrait, 59s + Ken Burns)
         run: |
-          ffmpeg \
-            -loop 1 -framerate 1 -i cover_portrait.jpg \
-            -i merged_audio.mp3 \
-            -c:v libx264 -tune stillimage -preset slow \
-            -c:a aac -b:a 192k \
-            -pix_fmt yuv420p \
-            -t 59 \
-            -movflags +faststart \
-            output_shorts.mp4
-          ls -lh output_shorts.mp4
+          python3 << 'EOF'
+          import subprocess, os
+
+          fps = 25
+          duration = 59
+          total_frames = fps * duration  # 1475
+
+          # Ken Burns: yavaş zoom 1.0 → 1.08, hafif pan sol→sağ
+          zoom_expr  = f"'min(1+on/{total_frames}*0.08,1.08)'"
+          pan_x_expr = f"'iw/2-(iw/zoom/2)+on/{total_frames}*20'"
+          pan_y_expr = "'ih/2-(ih/zoom/2)'"
+
+          vf = (
+              f"[0:v]scale=2160:3840,"
+              f"zoompan=z={zoom_expr}:x={pan_x_expr}:y={pan_y_expr}"
+              f":d={total_frames}:s=1080x1920:fps={fps}[v]"
+          )
+
+          print("Ken Burns Shorts render basliyor...")
+          subprocess.run([
+              "ffmpeg",
+              "-loop", "1", "-framerate", str(fps), "-i", "cover_portrait.jpg",
+              "-i", "merged_audio.mp3",
+              "-filter_complex", vf,
+              "-map", "[v]", "-map", "1:a",
+              "-c:v", "libx264", "-preset", "slow",
+              "-c:a", "aac", "-b:a", "192k",
+              "-pix_fmt", "yuv420p",
+              "-t", "59",
+              "-movflags", "+faststart",
+              "output_shorts.mp4"
+          ], check=True)
+
+          size = os.path.getsize("output_shorts.mp4")
+          print(f"output_shorts.mp4 hazir: {size/1024/1024:.1f} MB")
+          EOF
 
       - name: Upload to YouTube (long form)
         id: youtube_upload
@@ -285,8 +355,9 @@ jobs:
           )
           short_desc = (
               f"\U0001f3b5 {base_title}\n\n"
-              f"Relax, focus, and let the music flow. \u2728"
+              "Relax, focus, and let the music flow. \u2728"
               f"{full_video_line}\n\n"
+              "\U0001f514 More music: @GoldenSunsetLoungeVibes\n\n"
               "#Shorts #RelaxingMusic #ChillVibes #LoFi #AmbientMusic"
           )
 
