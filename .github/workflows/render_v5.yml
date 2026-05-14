@@ -268,7 +268,9 @@ jobs:
             "refresh_token": os.environ["YT_REFRESH_TOKEN"],
             "grant_type":    "refresh_token"
           })
-          access_token = r.json()["access_token"]
+          resp_data = r.json()
+          print("OAuth response:", resp_data)
+          access_token = resp_data["access_token"]
 
           with open("final_description.txt", "r") as f:
               description = f.read()
@@ -342,7 +344,9 @@ jobs:
             "refresh_token": os.environ["YT_REFRESH_TOKEN"],
             "grant_type":    "refresh_token"
           })
-          access_token = r.json()["access_token"]
+          resp_data = r.json()
+          print("OAuth response:", resp_data)
+          access_token = resp_data["access_token"]
 
           base_title    = os.environ["YT_TITLE"]
           main_video_id = os.environ.get("MAIN_VIDEO_ID", "")
