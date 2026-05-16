@@ -106,7 +106,7 @@ jobs:
                   prompt = "A vertical portrait 9:16 cinematic music album cover art, atmospheric, moody lighting, suitable for YouTube Shorts, high quality digital art"
 
               api_key = os.environ["GEMINI_API_KEY"]
-              url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key={api_key}"
+              url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
               body = {
                   "contents": [{"parts": [{"text": prompt}]}],
                   "generationConfig": {"responseModalities": ["image", "text"]}
