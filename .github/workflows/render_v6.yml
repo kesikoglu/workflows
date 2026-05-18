@@ -1,0 +1,460 @@
+name: Music Video Render & YouTube Upload V6
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_id:
+        description: 'Session ID'
+        required: true
+      audio_urls:
+        description: 'JSON array of audio URLs'
+        required: true
+      cover_image_url:
+        description: 'Cover image URL'
+        required: true
+      video_title:
+        description: 'YouTube video title'
+        required: true
+      youtube_description:
+        description: 'YouTube description'
+        required: true
+      youtube_tags:
+        description: 'Comma-separated tags'
+        required: true
+      track_titles:
+        description: 'JSON array of track titles (same order as audio_urls)'
+        required: false
+        default: '[]'
+      shorts_cover_url:
+        description: 'shorts.jpg Drive URL (optional, empty = Gemini ile portrait üret)'
+        required: false
+        default: ''
+      shorts_image_prompt:
+        description: 'Gemini için shorts görsel prompt (n8n den gelir)'
+        required: false
+        default: ''
+      shorts_title:
+        description: 'Optimized Shorts title (n8n GPT tarafından üretilir)'
+        required: false
+        default: ''
+      shorts_description:
+        description: 'Optimized Shorts description with hashtags (n8n GPT tarafından üretilir)'
+        required: false
+        default: ''
+
+jobs:
+  render-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y ffmpeg python3-pip
+          pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib requests
+
+      - name: Download all audio files
+        run: |
+         mkdir -p audio_files
+         python3 << 'EOF'
+         import json, requests
+
+         urls = json.loads('${{ inputs.audio_urls }}')
+         headers = {"User-Agent": "Mozilla/5.0 (compatible; MusicPipeline/1.0)"}
+         print(f"Downloading {len(urls)} audio files...")
+         for i, url in enumerate(urls):
+            dest = f"audio_files/track_{i:04d}.mp3"
+            r = requests.get(url, headers=headers, stream=True, timeout=120)
+            r.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            print(f" [{i+1}/{len(urls)}] {dest}")
+         EOF
+
+      - name: Download cover image
+        run: |
+          python3 -c "
+          import urllib.request
+          urllib.request.urlretrieve('${{ inputs.cover_image_url }}', 'cover_raw.jpg')
+          print('Cover downloaded.')
+          "
+
+      - name: Prepare cover 1920x1080 (landscape)
+        run: |
+          ffmpeg -i cover_raw.jpg \
+            -vf "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,setsar=1" \
+            cover_hd.jpg
+
+      # ── Shorts kapak: manuel varsa onu kullan, yoksa Gemini ile 9:16 portrait üret ──
+      - name: Prepare Shorts cover portrait 1080x1920
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SHORTS_COVER_URL: ${{ inputs.shorts_cover_url }}
+          SHORTS_IMAGE_PROMPT: ${{ inputs.shorts_image_prompt }}
+        run: |
+          python3 << 'EOF'
+          import os, requests, base64, json, subprocess
+
+          shorts_url = os.environ.get("SHORTS_COVER_URL", "").strip()
+
+          if shorts_url:
+              print("Manuel shorts.jpg bulundu, indiriliyor...")
+              r = requests.get(shorts_url, timeout=60)
+              r.raise_for_status()
+              with open("shorts_raw.jpg", "wb") as f:
+                  f.write(r.content)
+              print("shorts.jpg indirildi.")
+              use_raw = "shorts_raw.jpg"
+          else:
+              print("shorts_cover_url bos, Gemini ile 9:16 portrait gorsel uretiliyor...")
+              prompt = os.environ.get("SHORTS_IMAGE_PROMPT", "").strip()
+              if not prompt:
+                  prompt = "A vertical portrait 9:16 cinematic music album cover art, atmospheric, moody lighting, suitable for YouTube Shorts, high quality digital art"
+
+              api_key = os.environ["GEMINI_API_KEY"]
+              url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key={api_key}"
+              body = {
+                  "contents": [{"parts": [{"text": prompt}]}],
+                  "generationConfig": {"responseModalities": ["image", "text"]}
+              }
+              resp = requests.post(url, json=body, timeout=120)
+              resp.raise_for_status()
+              data = resp.json()
+
+              img_b64 = None
+              for part in data["candidates"][0]["content"]["parts"]:
+                  if "inlineData" in part:
+                      img_b64 = part["inlineData"]["data"]
+                      break
+
+              if not img_b64:
+                  print("Gemini gorsel dondurmedi, cover_raw.jpg crop kullaniliyor...")
+                  use_raw = "cover_raw.jpg"
+              else:
+                  with open("shorts_raw.jpg", "wb") as f:
+                      f.write(base64.b64decode(img_b64))
+                  print("Gemini 9:16 portrait gorsel uretildi.")
+                  use_raw = "shorts_raw.jpg"
+
+          subprocess.run([
+              "ffmpeg", "-i", use_raw,
+              "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
+              "cover_portrait.jpg"
+          ], check=True)
+          print("cover_portrait.jpg hazir.")
+          EOF
+
+      - name: Build FFmpeg concat list
+        run: |
+          ls audio_files/track_*.mp3 | sort | while read f; do
+            echo "file '$f'"
+          done > concat_list.txt
+          cat concat_list.txt
+
+      - name: Concatenate all audio
+        run: |
+          ffmpeg -f concat -safe 0 -i concat_list.txt -c copy merged_audio.mp3
+          DURATION=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 merged_audio.mp3)
+          echo "Total duration: ${DURATION}s"
+          echo "AUDIO_DURATION=${DURATION}" >> $GITHUB_ENV
+
+      - name: Build tracklist & final description
+        run: |
+          python3 << 'EOF'
+          import json, subprocess, os
+
+          audio_urls   = json.loads('${{ inputs.audio_urls }}')
+          track_titles = json.loads('${{ inputs.track_titles }}')
+          base_desc    = '''${{ inputs.youtube_description }}'''
+
+          durations = []
+          for i in range(len(audio_urls)):
+              path = f"audio_files/track_{i:04d}.mp3"
+              result = subprocess.run(
+                  ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                   "-of", "csv=p=0", path],
+                  capture_output=True, text=True
+              )
+              try:
+                  durations.append(float(result.stdout.strip()))
+              except:
+                  durations.append(0.0)
+
+          lines = []
+          cumulative = 0
+          for i, dur in enumerate(durations):
+              h = int(cumulative // 3600)
+              m = int((cumulative % 3600) // 60)
+              s = int(cumulative % 60)
+              timestamp = f"{h:02d}:{m:02d}:{s:02d}"
+              title = track_titles[i] if track_titles and i < len(track_titles) else f"Track {i+1}"
+              lines.append(f"{timestamp} {title}")
+              cumulative += dur
+
+          tracklist = "\n".join(lines)
+          final_desc = base_desc.strip() + "\n\n" + tracklist
+
+          with open("final_description.txt", "w") as f:
+              f.write(final_desc)
+
+          print("=== TRACKLIST ===")
+          print(tracklist)
+          print("=== FINAL DESCRIPTION ===")
+          print(final_desc[:500])
+          EOF
+
+      - name: Render video (landscape)
+        run: |
+          ffmpeg \
+            -loop 1 -framerate 1 -i cover_hd.jpg \
+            -i merged_audio.mp3 \
+            -c:v libx264 -tune stillimage -preset slow \
+            -c:a aac -b:a 192k \
+            -pix_fmt yuv420p \
+            -t "${{ env.AUDIO_DURATION }}" \
+            -movflags +faststart \
+            output.mp4
+          ls -lh output.mp4
+
+      # ── Shorts: Ken Burns efekti (zarif zoom + pan) ──
+      - name: Render Shorts video (portrait, 59s + Ken Burns)
+        run: |
+          python3 << 'EOF'
+          import subprocess, os
+
+          fps = 25
+          duration = 59
+          total_frames = fps * duration  # 1475
+
+          # Ken Burns: yavaş zoom 1.0 → 1.08, hafif pan sol→sağ
+          zoom_expr  = f"'min(1+on/{total_frames}*0.08,1.08)'"
+          pan_x_expr = f"'iw/2-(iw/zoom/2)+on/{total_frames}*20'"
+          pan_y_expr = "'ih/2-(ih/zoom/2)'"
+
+          vf = (
+              f"[0:v]scale=2160:3840,"
+              f"zoompan=z={zoom_expr}:x={pan_x_expr}:y={pan_y_expr}"
+              f":d={total_frames}:s=1080x1920:fps={fps}[v]"
+          )
+
+          print("Ken Burns Shorts render basliyor...")
+          subprocess.run([
+              "ffmpeg",
+              "-loop", "1", "-framerate", str(fps), "-i", "cover_portrait.jpg",
+              "-i", "merged_audio.mp3",
+              "-filter_complex", vf,
+              "-map", "[v]", "-map", "1:a",
+              "-c:v", "libx264", "-preset", "slow",
+              "-c:a", "aac", "-b:a", "192k",
+              "-pix_fmt", "yuv420p",
+              "-t", "59",
+              "-movflags", "+faststart",
+              "output_shorts.mp4"
+          ], check=True)
+
+          size = os.path.getsize("output_shorts.mp4")
+          print(f"output_shorts.mp4 hazir: {size/1024/1024:.1f} MB")
+          EOF
+
+      - name: Upload to YouTube (long form)
+        id: youtube_upload
+        env:
+          YT_CLIENT_ID:     ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          YT_TITLE:         ${{ inputs.video_title }}
+          YT_TAGS:          ${{ inputs.youtube_tags }}
+        run: |
+          python3 << 'EOF'
+          import os, json, requests
+
+          r = requests.post("https://oauth2.googleapis.com/token", data={
+            "client_id":     os.environ["YT_CLIENT_ID"],
+            "client_secret": os.environ["YT_CLIENT_SECRET"],
+            "refresh_token": os.environ["YT_REFRESH_TOKEN"],
+            "grant_type":    "refresh_token"
+          })
+          resp_data = r.json()
+          print("OAuth response:", resp_data)
+          access_token = resp_data["access_token"]
+
+          with open("final_description.txt", "r") as f:
+              description = f.read()
+
+          meta = {
+            "snippet": {
+              "title":       os.environ["YT_TITLE"],
+              "description": description,
+              "tags":        [t.strip() for t in os.environ["YT_TAGS"].split(",")],
+              "categoryId":  "10"
+            },
+            "status": { "privacyStatus": "public" }
+          }
+
+          init = requests.post(
+            "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
+            headers={
+              "Authorization": f"Bearer {access_token}",
+              "Content-Type":  "application/json; charset=UTF-8",
+              "X-Upload-Content-Type": "video/mp4"
+            },
+            data=json.dumps(meta)
+          )
+          upload_url = init.headers["Location"]
+
+          file_size  = os.path.getsize("output.mp4")
+          chunk_size = 50 * 1024 * 1024
+          uploaded   = 0
+
+          with open("output.mp4", "rb") as f:
+            while uploaded < file_size:
+              chunk = f.read(chunk_size)
+              end   = uploaded + len(chunk) - 1
+              resp  = requests.put(
+                upload_url,
+                headers={
+                  "Authorization": f"Bearer {access_token}",
+                  "Content-Range": f"bytes {uploaded}-{end}/{file_size}",
+                  "Content-Type":  "video/mp4"
+                },
+                data=chunk
+              )
+              uploaded += len(chunk)
+              print(f"Uploaded {uploaded}/{file_size} ({100*uploaded//file_size}%)")
+
+          video_id = resp.json().get("id", "unknown")
+          print(f"Done! https://youtube.com/watch?v={video_id}")
+
+          gh_output = os.environ.get("GITHUB_OUTPUT", "")
+          if gh_output:
+              with open(gh_output, "a") as fh:
+                  fh.write(f"video_id={video_id}\n")
+          EOF
+
+      # ── V6 YENİLİK: GPT tarafından üretilen shorts_title ve shorts_description kullanılıyor ──
+      - name: Upload to YouTube (Shorts)
+        id: shorts_upload
+        env:
+          YT_CLIENT_ID:      ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET:  ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN:  ${{ secrets.YT_REFRESH_TOKEN }}
+          YT_TITLE:          ${{ inputs.video_title }}
+          YT_TAGS:           ${{ inputs.youtube_tags }}
+          SHORTS_TITLE:      ${{ inputs.shorts_title }}
+          SHORTS_DESCRIPTION: ${{ inputs.shorts_description }}
+          MAIN_VIDEO_ID:     ${{ steps.youtube_upload.outputs.video_id }}
+        run: |
+          python3 << 'EOF'
+          import os, json, requests
+
+          r = requests.post("https://oauth2.googleapis.com/token", data={
+            "client_id":     os.environ["YT_CLIENT_ID"],
+            "client_secret": os.environ["YT_CLIENT_SECRET"],
+            "refresh_token": os.environ["YT_REFRESH_TOKEN"],
+            "grant_type":    "refresh_token"
+          })
+          resp_data = r.json()
+          print("OAuth response:", resp_data)
+          access_token = resp_data["access_token"]
+
+          base_title    = os.environ["YT_TITLE"]
+          main_video_id = os.environ.get("MAIN_VIDEO_ID", "")
+
+          # V6: GPT'den gelen shorts_title varsa onu kullan, yoksa eski yönteme dön
+          shorts_title_input = os.environ.get("SHORTS_TITLE", "").strip()
+          if shorts_title_input:
+              short_title = shorts_title_input
+          else:
+              short_title = base_title[:70] + " #Shorts"
+
+          # V6: GPT'den gelen shorts_description varsa onu kullan, yoksa eski yönteme dön
+          shorts_desc_input = os.environ.get("SHORTS_DESCRIPTION", "").strip()
+          if shorts_desc_input:
+              full_video_line = (
+                  f"\n\n\U0001f3ac Full version: https://youtube.com/watch?v={main_video_id}"
+                  if main_video_id and main_video_id != "unknown" else ""
+              )
+              short_desc = shorts_desc_input + full_video_line + "\n\n\U0001f514 More music: @GoldenSunsetLoungeVibes"
+          else:
+              full_video_line = (
+                  f"\n\n\U0001f3ac Full version: https://youtube.com/watch?v={main_video_id}"
+                  if main_video_id and main_video_id != "unknown" else ""
+              )
+              short_desc = (
+                  f"\U0001f3b5 {base_title}\n\n"
+                  "Relax, focus, and let the music flow. \u2728"
+                  f"{full_video_line}\n\n"
+                  "\U0001f514 More music: @GoldenSunsetLoungeVibes\n\n"
+                  "#Shorts #RelaxingMusic #ChillVibes #LoFi #AmbientMusic"
+              )
+
+          tags = [t.strip() for t in os.environ["YT_TAGS"].split(",")]
+          tags = list(dict.fromkeys(tags + ["Shorts", "YouTube Shorts", "Relaxing Music Short"]))
+
+          meta = {
+            "snippet": {
+              "title":       short_title,
+              "description": short_desc,
+              "tags":        tags,
+              "categoryId":  "10"
+            },
+            "status": { "privacyStatus": "public" }
+          }
+
+          init = requests.post(
+            "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
+            headers={
+              "Authorization": f"Bearer {access_token}",
+              "Content-Type":  "application/json; charset=UTF-8",
+              "X-Upload-Content-Type": "video/mp4"
+            },
+            data=json.dumps(meta)
+          )
+          upload_url = init.headers["Location"]
+
+          file_size  = os.path.getsize("output_shorts.mp4")
+          chunk_size = 50 * 1024 * 1024
+          uploaded   = 0
+
+          with open("output_shorts.mp4", "rb") as f:
+            while uploaded < file_size:
+              chunk = f.read(chunk_size)
+              end   = uploaded + len(chunk) - 1
+              resp  = requests.put(
+                upload_url,
+                headers={
+                  "Authorization": f"Bearer {access_token}",
+                  "Content-Range": f"bytes {uploaded}-{end}/{file_size}",
+                  "Content-Type":  "video/mp4"
+                },
+                data=chunk
+              )
+              uploaded += len(chunk)
+              print(f"Shorts {uploaded}/{file_size} ({100*uploaded//file_size}%)")
+
+          shorts_id = resp.json().get("id", "unknown")
+          print(f"Shorts done! https://youtube.com/shorts/{shorts_id}")
+
+          gh_output = os.environ.get("GITHUB_OUTPUT", "")
+          if gh_output:
+              with open(gh_output, "a") as fh:
+                  fh.write(f"shorts_id={shorts_id}\n")
+          EOF
+
+      - name: Notify n8n — YouTube Complete
+        if: always()
+        run: |
+          VIDEO_ID="${{ steps.youtube_upload.outputs.video_id }}"
+          SHORTS_ID="${{ steps.shorts_upload.outputs.shorts_id }}"
+          echo "VIDEO_ID: $VIDEO_ID"
+          echo "SHORTS_ID: $SHORTS_ID"
+          if [ -n "$VIDEO_ID" ] && [ "$VIDEO_ID" != "unknown" ]; then
+            curl -s -X POST "https://n8n.unicoats.com/webhook/61666b00-1f43-4a9d-aeea-6ac5691354aa" \
+              -H "Content-Type: application/json" \
+              -d "{\"session_id\": \"${{ inputs.session_id }}\", \"youtube_id\": \"$VIDEO_ID\", \"shorts_id\": \"$SHORTS_ID\"}"
+            echo "n8n callback gonderildi."
+          else
+            echo "VIDEO_ID bulunamadi, callback atlandi."
+          fi
