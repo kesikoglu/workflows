@@ -282,7 +282,7 @@ jobs:
               "tags":        [t.strip() for t in os.environ["YT_TAGS"].split(",")],
               "categoryId":  "10"
             },
-            "status": { "privacyStatus": "public" }
+            "status": { "privacyStatus": "unlisted" }
           }
 
           init = requests.post(
@@ -375,7 +375,7 @@ jobs:
               "tags":        tags,
               "categoryId":  "10"
             },
-            "status": { "privacyStatus": "public" }
+            "status": { "privacyStatus": "unlisted" }
           }
 
           init = requests.post(
