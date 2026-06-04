@@ -1,0 +1,167 @@
+name: Render Mythos Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_id:          { required: true,  type: string }
+      scene_image_urls:    { required: true,  type: string }   # JSON array, ordered
+      scene_audio_urls:    { required: true,  type: string }   # JSON array, ordered, same length
+      thumbnail_url:       { required: true,  type: string }   # base cinematic image (from n8n Gemini)
+      thumbnail_text:      { required: true,  type: string }   # <=3 words, overlaid in gold
+      video_title:         { required: true,  type: string }
+      youtube_description: { required: true,  type: string }
+      youtube_tags:        { required: true,  type: string }
+      bg_music_url:        { required: false, type: string, default: '' }
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Setup tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+          python3 -m pip install --quiet --upgrade pip
+          python3 -m pip install --quiet requests pillow openai-whisper \
+            google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib
+          # Cinzel for thumbnail text
+          mkdir -p fonts
+          curl -sL "https://raw.githubusercontent.com/google/fonts/main/ofl/cinzel/Cinzel%5Bwght%5D.ttf" -o fonts/Cinzel.ttf
+
+      - name: Render & upload
+        env:
+          SESSION_ID:        ${{ inputs.session_id }}
+          SCENE_IMAGES:      ${{ inputs.scene_image_urls }}
+          SCENE_AUDIOS:      ${{ inputs.scene_audio_urls }}
+          THUMB_URL:         ${{ inputs.thumbnail_url }}
+          THUMB_TEXT:        ${{ inputs.thumbnail_text }}
+          VIDEO_TITLE:       ${{ inputs.video_title }}
+          YT_DESCRIPTION:    ${{ inputs.youtube_description }}
+          YT_TAGS:           ${{ inputs.youtube_tags }}
+          BG_URL:            ${{ inputs.bg_music_url }}
+          YT_CLIENT_ID:      ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET:  ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN:  ${{ secrets.YT_MYTHOS_REFRESH_TOKEN }}
+          N8N_CALLBACK:      ${{ secrets.N8N_MYTHOS_CALLBACK }}
+        run: |
+          python3 - <<'PY'
+          import os, json, subprocess, tempfile, urllib.request, sys
+
+          def sh(*a): subprocess.run(list(a), check=True)
+          def dl(url, path):
+              urllib.request.urlretrieve(url, path); return path
+          def dur(path):
+              out = subprocess.check_output(["ffprobe","-v","error","-show_entries",
+                  "format=duration","-of","default=nw=1:nk=1", path]).decode().strip()
+              return float(out)
+
+          imgs  = json.loads(os.environ["SCENE_IMAGES"])
+          auds  = json.loads(os.environ["SCENE_AUDIOS"])
+          assert len(imgs) == len(auds) and len(imgs) > 0, "image/audio count mismatch"
+
+          os.makedirs("work", exist_ok=True)
+
+          # 1) download assets
+          scene_files = []
+          for i,(iu,au) in enumerate(zip(imgs,auds)):
+              ip = f"work/img_{i}.jpg"; ap = f"work/aud_{i}.mp3"
+              dl(iu, ip); dl(au, ap)
+              scene_files.append((ip, ap, dur(ap)))
+
+          # 2) per-scene Ken Burns clip lasting exactly that scene's audio duration
+          FPS = 30
+          clip_list = "work/clips.txt"
+          with open(clip_list,"w") as cl:
+              for i,(ip,ap,d) in enumerate(scene_files):
+                  frames = max(int(d*FPS), FPS)
+                  # alternate slow zoom-in / zoom-out for variety
+                  zexpr = "min(zoom+0.0006,1.15)" if i%2==0 else "if(lte(zoom,1.0),1.15,max(1.001,zoom-0.0006))"
+                  vf = (f"scale=2400:-1,zoompan=z='{zexpr}':d={frames}:"
+                        f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1920x1080:fps={FPS},setsar=1,format=yuv420p")
+                  out = f"work/clip_{i}.mp4"
+                  sh("ffmpeg","-y","-loop","1","-t",f"{d}","-i",ip,"-vf",vf,
+                     "-c:v","libx264","-preset","medium","-r",str(FPS),out)
+                  cl.write(f"file 'clip_{i}.mp4'\n")
+          sh("ffmpeg","-y","-f","concat","-safe","0","-i",clip_list,"-c","copy","work/video_silent.mp4")
+
+          # 3) concat narration audio
+          alist = "work/auds.txt"
+          with open(alist,"w") as af:
+              for i,_ in enumerate(scene_files): af.write(f"file 'aud_{i}.mp3'\n")
+          sh("ffmpeg","-y","-f","concat","-safe","0","-i",alist,"-c:a","aac","-b:a","192k","work/narration.m4a")
+
+          # 4) optional ambient bed mix
+          narration = "work/narration.m4a"
+          bg = os.environ.get("BG_URL","").strip()
+          if bg:
+              dl(bg,"work/bg.mp3")
+              sh("ffmpeg","-y","-i",narration,"-stream_loop","-1","-i","work/bg.mp3",
+                 "-filter_complex","[1:a]volume=0.12[b];[0:a][b]amix=inputs=2:duration=first:dropout_transition=0[a]",
+                 "-map","[a]","-c:a","aac","-b:a","192k","work/audio_final.m4a")
+              audio = "work/audio_final.m4a"
+          else:
+              audio = narration
+
+          # 5) subtitles via Whisper (on the narration we just built)
+          sh("whisper", narration, "--model","base","--language","en",
+             "--output_format","srt","--output_dir","work","--fp16","False")
+          srt = "work/narration.srt"
+          subs = ""
+          if os.path.exists(srt):
+              style = ("FontName=DejaVu Sans,Fontsize=20,PrimaryColour=&H00FFFFFF,"
+                       "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,MarginV=70")
+              subs = f",subtitles=work/narration.srt:force_style='{style}'"
+
+          # 6) final mux (burn subs onto video, attach mixed audio)
+          sh("ffmpeg","-y","-i","work/video_silent.mp4","-i",audio,
+             "-vf",f"null{subs}","-map","0:v","-map","1:a",
+             "-c:v","libx264","-preset","medium","-c:a","aac","-shortest","work/final.mp4")
+
+          # 7) thumbnail: base image + gold Cinzel text overlay
+          from PIL import Image, ImageDraw, ImageFont
+          dl(os.environ["THUMB_URL"], "work/thumb_base.jpg")
+          im = Image.open("work/thumb_base.jpg").convert("RGB").resize((1280,720))
+          d  = ImageDraw.Draw(im)
+          txt = os.environ["THUMB_TEXT"].upper()
+          fs = 150
+          font = ImageFont.truetype("fonts/Cinzel.ttf", fs)
+          while d.textlength(txt, font=font) > 1180 and fs > 60:
+              fs -= 6; font = ImageFont.truetype("fonts/Cinzel.ttf", fs)
+          tw = d.textlength(txt, font=font)
+          x = (1280-tw)/2; y = 520
+          for ox,oy in [(-3,-3),(3,-3),(-3,3),(3,3),(0,4)]:
+              d.text((x+ox,y+oy), txt, font=font, fill=(5,7,15))
+          d.text((x,y), txt, font=font, fill=(232,199,90))
+          im.save("work/thumb.jpg", quality=90)
+
+          # 8) upload to YouTube as UNLISTED on the Mythos channel
+          from google.oauth2.credentials import Credentials
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+          creds = Credentials(None,
+              refresh_token=os.environ["YT_REFRESH_TOKEN"],
+              client_id=os.environ["YT_CLIENT_ID"],
+              client_secret=os.environ["YT_CLIENT_SECRET"],
+              token_uri="https://oauth2.googleapis.com/token")
+          yt = build("youtube","v3",credentials=creds)
+          tags = [t.strip() for t in os.environ["YT_TAGS"].split(",") if t.strip()][:30]
+          body = {"snippet":{"title":os.environ["VIDEO_TITLE"][:100],
+                             "description":os.environ["YT_DESCRIPTION"],
+                             "tags":tags,"categoryId":"27"},   # 27 = Education
+                  "status":{"privacyStatus":"unlisted","selfDeclaredMadeForKids":False}}
+          req = yt.videos().insert(part="snippet,status", body=body,
+                    media_body=MediaFileUpload("work/final.mp4", chunksize=-1, resumable=True))
+          resp=None
+          while resp is None:
+              status, resp = req.next_chunk()
+          vid = resp["id"]
+          yt.thumbnails().set(videoId=vid, media_body=MediaFileUpload("work/thumb.jpg")).execute()
+          print("Uploaded (unlisted):", vid)
+
+          # 9) notify n8n
+          cb = os.environ.get("N8N_CALLBACK","").strip()
+          if cb:
+              import requests
+              requests.post(cb, json={"session_id":os.environ["SESSION_ID"],"youtube_id":vid}, timeout=30)
+          PY
