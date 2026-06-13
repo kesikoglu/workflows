@@ -54,6 +54,21 @@ jobs:
           sudo apt-get install -y ffmpeg python3-pip
           pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib requests
 
+      - name: Save inputs to files
+        run: |
+          cat > audio_urls.json << 'EOF'
+          ${{ inputs.audio_urls }}
+          EOF
+          cat > track_titles.json << 'EOF'
+          ${{ inputs.track_titles }}
+          EOF
+          cat > youtube_description.txt << 'EOF'
+          ${{ inputs.youtube_description }}
+          EOF
+          echo "Input files saved."
+          echo "audio_urls.json: $(cat audio_urls.json)"
+          echo "track_titles.json: $(cat track_titles.json)"
+
       - name: Download all audio files
         env:
           AUDIO_URLS_JSON: ${{ inputs.audio_urls }}
@@ -93,8 +108,8 @@ jobs:
 
       - name: Prepare Shorts cover portrait 1080x1920
         env:
-          GEMINI_API_KEY:    ${{ secrets.GEMINI_API_KEY }}
-          SHORTS_COVER_URL:  ${{ inputs.shorts_cover_url }}
+          GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
+          SHORTS_COVER_URL:    ${{ inputs.shorts_cover_url }}
           SHORTS_IMAGE_PROMPT: ${{ inputs.shorts_image_prompt }}
         run: |
           python3 << 'EOF'
@@ -164,17 +179,18 @@ jobs:
           echo "AUDIO_DURATION=${DURATION}" >> $GITHUB_ENV
 
       - name: Build tracklist & final description
-        env:
-          AUDIO_URLS_JSON:    ${{ inputs.audio_urls }}
-          TRACK_TITLES_JSON:  ${{ inputs.track_titles }}
-          BASE_DESC:          ${{ inputs.youtube_description }}
         run: |
           python3 << 'EOF'
           import json, subprocess, os
 
-          audio_urls   = json.loads(os.environ["AUDIO_URLS_JSON"])
-          track_titles = json.loads(os.environ["TRACK_TITLES_JSON"])
-          base_desc    = os.environ["BASE_DESC"]
+          with open("audio_urls.json", "r") as f:
+              audio_urls = json.load(f)
+
+          with open("track_titles.json", "r") as f:
+              track_titles = json.load(f)
+
+          with open("youtube_description.txt", "r") as f:
+              base_desc = f.read()
 
           durations = []
           for i in range(len(audio_urls)):
