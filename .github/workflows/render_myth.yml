@@ -13,6 +13,9 @@ on:
       youtube_tags:        { required: true,  type: string }
       bg_music_url:        { required: false, type: string, default: '' }
 
+permissions:
+  contents: read
+
 jobs:
   render:
     runs-on: ubuntu-latest
@@ -45,6 +48,7 @@ jobs:
           YT_CLIENT_SECRET:  ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN:  ${{ secrets.YT_MYTHOS_REFRESH_TOKEN }}
           N8N_CALLBACK:      ${{ secrets.N8N_MYTHOS_CALLBACK }}
+          N8N_KEY:           ${{ secrets.N8N_KEY }}
         run: |
           python3 - <<'PY'
           import os, json, subprocess, tempfile, urllib.request, sys, requests
@@ -191,5 +195,8 @@ jobs:
           # 9) Notify n8n
           cb = os.environ.get("N8N_CALLBACK", "").strip()
           if cb:
-              requests.post(cb, json={"session_id": os.environ["SESSION_ID"], "youtube_id": vid}, timeout=30)
+              requests.post(cb,
+                            json={"session_id": os.environ["SESSION_ID"], "youtube_id": vid},
+                            headers={"X-N8N-KEY": os.environ.get("N8N_KEY", "")},
+                            timeout=30)
           PY

@@ -26,6 +26,9 @@ on:
         required: false
         default: '[]'
 
+permissions:
+  contents: read
+
 jobs:
   render-and-upload:
     runs-on: ubuntu-latest
@@ -39,12 +42,14 @@ jobs:
           pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib requests
 
       - name: Download all audio files
+        env:
+          AUDIO_URLS_JSON: ${{ inputs.audio_urls }}
         run: |
          mkdir -p audio_files
          python3 << 'EOF'
-         import json, requests
+         import json, os, requests
 
-         urls = json.loads('${{ inputs.audio_urls }}')
+         urls = json.loads(os.environ["AUDIO_URLS_JSON"])
          headers = {"User-Agent": "Mozilla/5.0 (compatible; MusicPipeline/1.0)"}
          print(f"Downloading {len(urls)} audio files...")
          for i, url in enumerate(urls):
@@ -58,10 +63,12 @@ jobs:
          EOF
 
       - name: Download cover image
+        env:
+          COVER_IMAGE_URL: ${{ inputs.cover_image_url }}
         run: |
           python3 -c "
-          import urllib.request
-          urllib.request.urlretrieve('${{ inputs.cover_image_url }}', 'cover_raw.jpg')
+          import os, urllib.request
+          urllib.request.urlretrieve(os.environ['COVER_IMAGE_URL'], 'cover_raw.jpg')
           print('Cover downloaded.')
           "
 
@@ -86,13 +93,17 @@ jobs:
           echo "AUDIO_DURATION=${DURATION}" >> $GITHUB_ENV
 
       - name: Build tracklist & final description
+        env:
+          AUDIO_URLS_JSON:    ${{ inputs.audio_urls }}
+          TRACK_TITLES_JSON:  ${{ inputs.track_titles }}
+          YT_DESCRIPTION_RAW: ${{ inputs.youtube_description }}
         run: |
           python3 << 'EOF'
           import json, subprocess, os, re
 
-          audio_urls   = json.loads('${{ inputs.audio_urls }}')
-          track_titles = json.loads('${{ inputs.track_titles }}')
-          base_desc    = '''${{ inputs.youtube_description }}'''
+          audio_urls   = json.loads(os.environ["AUDIO_URLS_JSON"])
+          track_titles = json.loads(os.environ["TRACK_TITLES_JSON"])
+          base_desc    = os.environ["YT_DESCRIPTION_RAW"]
 
           # Her track'in süresini ffprobe ile ölç
           durations = []
@@ -229,13 +240,17 @@ jobs:
 
       - name: Notify n8n — YouTube Complete
         if: always()
+        env:
+          SESSION_ID: ${{ inputs.session_id }}
+          N8N_KEY:    ${{ secrets.N8N_KEY }}
         run: |
           VIDEO_ID="${{ steps.youtube_upload.outputs.video_id }}"
           echo "VIDEO_ID: $VIDEO_ID"
           if [ -n "$VIDEO_ID" ] && [ "$VIDEO_ID" != "unknown" ]; then
             curl -s -X POST "https://n8n-production-eefc3.up.railway.app/webhook/youtube-complete" \
               -H "Content-Type: application/json" \
-              -d "{\"session_id\": \"${{ inputs.session_id }}\", \"youtube_id\": \"$VIDEO_ID\"}"
+              -H "X-N8N-KEY: $N8N_KEY" \
+              -d "$(jq -nc --arg s "$SESSION_ID" --arg v "$VIDEO_ID" '{session_id:$s, youtube_id:$v}')"
             echo "n8n callback gönderildi."
           else
             echo "VIDEO_ID bulunamadı, callback atlandı."

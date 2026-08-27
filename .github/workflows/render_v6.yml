@@ -42,6 +42,9 @@ on:
         required: false
         default: ''
 
+permissions:
+  contents: read
+
 jobs:
   render-and-upload:
     runs-on: ubuntu-latest
@@ -55,16 +58,14 @@ jobs:
           pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib requests
 
       - name: Save inputs to files
+        env:
+          AUDIO_URLS_JSON:    ${{ inputs.audio_urls }}
+          TRACK_TITLES_JSON:  ${{ inputs.track_titles }}
+          YT_DESCRIPTION_RAW: ${{ inputs.youtube_description }}
         run: |
-          cat > audio_urls.json << 'EOF'
-          ${{ inputs.audio_urls }}
-          EOF
-          cat > track_titles.json << 'EOF'
-          ${{ inputs.track_titles }}
-          EOF
-          cat > youtube_description.txt << 'EOF'
-          ${{ inputs.youtube_description }}
-          EOF
+          printf '%s' "$AUDIO_URLS_JSON"    > audio_urls.json
+          printf '%s' "$TRACK_TITLES_JSON"  > track_titles.json
+          printf '%s' "$YT_DESCRIPTION_RAW" > youtube_description.txt
           echo "Input files saved."
           echo "audio_urls.json: $(cat audio_urls.json)"
           echo "track_titles.json: $(cat track_titles.json)"
@@ -457,6 +458,9 @@ jobs:
 
       - name: Notify n8n — YouTube Complete
         if: always()
+        env:
+          SESSION_ID: ${{ inputs.session_id }}
+          N8N_KEY:    ${{ secrets.N8N_KEY }}
         run: |
           VIDEO_ID="${{ steps.youtube_upload.outputs.video_id }}"
           SHORTS_ID="${{ steps.shorts_upload.outputs.shorts_id }}"
@@ -470,7 +474,8 @@ jobs:
               --retry-delay 10 \
               --retry-all-errors \
               -H "Content-Type: application/json" \
-              -d "{\"session_id\": \"${{ inputs.session_id }}\", \"youtube_id\": \"$VIDEO_ID\", \"shorts_id\": \"$SHORTS_ID\"}" || echo "n8n callback failed but video uploaded successfully"
+              -H "X-N8N-KEY: $N8N_KEY" \
+              -d "$(jq -nc --arg s "$SESSION_ID" --arg v "$VIDEO_ID" --arg h "$SHORTS_ID" '{session_id:$s, youtube_id:$v, shorts_id:$h}')" || echo "n8n callback failed but video uploaded successfully"
             echo "n8n callback gonderildi."
           else
             echo "VIDEO_ID bulunamadi, callback atlandi."
