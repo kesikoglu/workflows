@@ -78,17 +78,50 @@ jobs:
           python3 << 'EOF'
           import json, requests, os
 
+          import re, time
+
           urls = json.loads(os.environ["AUDIO_URLS_JSON"])
           headers = {"User-Agent": "Mozilla/5.0 (compatible; MusicPipeline/1.0)"}
+
+          # KIE (Ekim 2026) artik sourceAudioUrl (cdn1.suno.ai) donmuyor; stream linkleri
+          # (audiostream.kie.ai) uretim bitince 403 veriyor. Ayni ID ile kalici adresleri dene.
+          def candidates(url):
+              m = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.mp3", url)
+              if not m:
+                  return [url]
+              sid = m.group(1)
+              c = [url,
+                   f"https://tempfile.aiquickdraw.com/r/{sid}.mp3",
+                   f"https://cdn1.suno.ai/{sid}.mp3"]
+              if "audiostream.kie.ai" in url:
+                  c = c[1:] + [url]
+              return list(dict.fromkeys(c))
+
           print(f"Downloading {len(urls)} audio files...")
           for i, url in enumerate(urls):
               dest = f"audio_files/track_{i:04d}.mp3"
-              r = requests.get(url, headers=headers, stream=True, timeout=120)
-              r.raise_for_status()
-              with open(dest, "wb") as f:
-                  for chunk in r.iter_content(chunk_size=8192):
-                      f.write(chunk)
-              print(f" [{i+1}/{len(urls)}] {dest}")
+              ok = False
+              for cand in candidates(url):
+                  for attempt in range(3):
+                      try:
+                          r = requests.get(cand, headers=headers, stream=True, timeout=120)
+                          r.raise_for_status()
+                          with open(dest, "wb") as f:
+                              for chunk in r.iter_content(chunk_size=8192):
+                                  f.write(chunk)
+                          if os.path.getsize(dest) > 100_000:
+                              ok = True
+                              break
+                      except Exception as e:
+                          print(f"   ! {cand} -> {e}")
+                          if "403" in str(e) or "404" in str(e):
+                              break
+                          time.sleep(5)
+                  if ok:
+                      print(f" [{i+1}/{len(urls)}] {dest} <- {cand}")
+                      break
+              if not ok:
+                  raise SystemExit(f"Track {i+1} indirilemedi: {url}")
           EOF
 
       - name: Download cover image
