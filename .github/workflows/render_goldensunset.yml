@@ -46,6 +46,10 @@ on:
       thumbnail_image_url:
         description: 'Prevalidated thumbnail image URL'
         required: true
+      max_duration_seconds:
+        description: 'Optional render cap for an approved short test; 0 keeps full audio'
+        required: false
+        default: '0'
 
 concurrency:
   group: goldensunset-${{ inputs.session_id }}
@@ -186,11 +190,27 @@ jobs:
           cat concat_list.txt
 
       - name: Concatenate all audio
+        env:
+          MAX_DURATION_SECONDS: ${{ inputs.max_duration_seconds }}
         run: |
           ffmpeg -f concat -safe 0 -i concat_list.txt -c copy merged_audio.mp3
-          DURATION=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 merged_audio.mp3)
-          echo "Total duration: ${DURATION}s"
-          echo "AUDIO_DURATION=${DURATION}" >> $GITHUB_ENV
+          python3 << 'EOF'
+          import math, os, subprocess
+          duration = float(subprocess.check_output([
+              'ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
+              '-of', 'csv=p=0', 'merged_audio.mp3'
+          ], text=True).strip())
+          cap = float(os.environ.get('MAX_DURATION_SECONDS') or '0')
+          if not math.isfinite(duration) or duration <= 0 or not math.isfinite(cap) or cap < 0:
+              raise RuntimeError('Invalid render duration')
+          if cap:
+              if duration < cap:
+                  raise RuntimeError('Generated audio is shorter than the requested test')
+              duration = cap
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write(f'AUDIO_DURATION={duration}\n')
+          print(f'Render duration: {duration:.2f}s')
+          EOF
 
       - name: Build tracklist & final description
         run: |
@@ -227,6 +247,8 @@ jobs:
           lines = []
           cumulative = 0
           for i, dur in enumerate(durations):
+              if cumulative >= float(os.environ['AUDIO_DURATION']):
+                  break
               h = int(cumulative // 3600)
               m = int((cumulative % 3600) // 60)
               s = int(cumulative % 60)
