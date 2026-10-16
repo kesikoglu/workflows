@@ -151,10 +151,10 @@ jobs:
           print("Cover downloaded.")
           EOF
 
-      - name: Prepare cover 1920x1080 (landscape)
+      - name: Prepare cover 3840x2160 (landscape UHD)
         run: |
           ffmpeg -i cover_raw.jpg \
-            -vf "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,setsar=1" \
+            -vf "scale=3840:2160:force_original_aspect_ratio=increase:flags=lanczos,crop=3840:2160,setsar=1" \
             cover_hd.jpg
 
       - name: Prepare Shorts cover portrait 1080x1920
@@ -291,10 +291,10 @@ jobs:
               parsed = urllib.parse.urlparse(background_url)
               if parsed.scheme != 'https' or parsed.hostname != 'res.cloudinary.com' or not parsed.path.startswith('/desntuwcc/video/upload/'):
                   raise RuntimeError('Prepared scene loop must use the configured Cloudinary account')
-              with urllib.request.urlopen(background_url, timeout=90) as response, open('motion_loop.mp4', 'wb') as target:
+              with urllib.request.urlopen(background_url, timeout=90) as response, open('source_loop.mp4', 'wb') as target:
                   shutil.copyfileobj(response, target)
               probe = json.loads(subprocess.check_output([
-                  'ffprobe', '-v', 'error', '-show_streams', '-show_format', '-of', 'json', 'motion_loop.mp4'
+                  'ffprobe', '-v', 'error', '-show_streams', '-show_format', '-of', 'json', 'source_loop.mp4'
               ], text=True))
               videos = [s for s in probe['streams'] if s['codec_type'] == 'video']
               if len(videos) != 1 or any(s['codec_type'] == 'audio' for s in probe['streams']):
@@ -302,14 +302,26 @@ jobs:
               video = videos[0]
               rate_n, rate_d = map(float, video['avg_frame_rate'].split('/'))
               loop_duration = float(probe['format']['duration'])
-              if (video['width'], video['height'], video['codec_name'], video['pix_fmt']) != (1920, 1080, 'h264', 'yuv420p') or rate_d <= 0 or abs(rate_n/rate_d-25) > .01 or not 0 < loop_duration <= 120:
-                  raise RuntimeError('Scene loop must be 1080p/25fps H.264 and at most 120 seconds')
-              print('Prepared fixed-camera steam loop validated.')
+              dimensions = (video['width'], video['height'])
+              if dimensions not in [(1920, 1080), (3840, 2160)] or (video['codec_name'], video['pix_fmt']) != ('h264', 'yuv420p') or rate_d <= 0 or abs(rate_n/rate_d-25) > .01 or not 0 < loop_duration <= 120:
+                  raise RuntimeError('Scene loop must be 1080p or UHD/25fps H.264 and at most 120 seconds')
+              if dimensions == (3840, 2160):
+                  shutil.copyfile('source_loop.mp4', 'motion_loop.mp4')
+              else:
+                  # Upscale only the short accepted loop, preserving its timing and scene motion.
+                  subprocess.run([
+                      'ffmpeg', '-y', '-i', 'source_loop.mp4', '-an',
+                      '-vf', 'scale=3840:2160:flags=lanczos,setsar=1',
+                      '-c:v', 'libx264', '-threads', '2', '-preset', 'medium',
+                      '-crf', '19', '-pix_fmt', 'yuv420p',
+                      '-movflags', '+faststart', 'motion_loop.mp4'
+                  ], check=True)
+              print('Prepared fixed-camera scene loop ready at 3840x2160/25fps.')
           else:
               subprocess.run([
-                  'ffmpeg', '-y', '-loop', '1', '-framerate', '1', '-i', 'cover_hd.jpg',
+                  'ffmpeg', '-y', '-loop', '1', '-framerate', '25', '-i', 'cover_hd.jpg',
                   '-t', '12', '-an', '-c:v', 'libx264', '-tune', 'stillimage',
-                  '-preset', 'medium', '-crf', '20', '-bf', '0', '-pix_fmt', 'yuv420p',
+                  '-threads', '2', '-preset', 'medium', '-crf', '19', '-bf', '0', '-pix_fmt', 'yuv420p',
                   '-movflags', '+faststart', 'motion_loop.mp4'
               ], check=True)
               print('Static camera background prepared; no scene-specific animation configured.')
@@ -320,7 +332,12 @@ jobs:
               '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
               '-t', str(duration), '-movflags', '+faststart', 'output.mp4'
           ], check=True)
-          print(f'Fixed-camera landscape ready: {duration:.2f}s, 1920x1080')
+          output_probe = json.loads(subprocess.check_output([
+              'ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_streams', '-of', 'json', 'output.mp4'
+          ], text=True))['streams'][0]
+          if (output_probe['width'], output_probe['height']) != (3840, 2160):
+              raise RuntimeError('Long video did not render at UHD resolution')
+          print(f'Fixed-camera landscape ready: {duration:.2f}s, 3840x2160/25fps')
           EOF
 
       - name: Render Shorts video (portrait, 59s + Ken Burns)
@@ -609,4 +626,3 @@ jobs:
             echo "Session ID missing; callback skipped."
             exit 1
           fi
-
