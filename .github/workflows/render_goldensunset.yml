@@ -1,0 +1,550 @@
+name: GoldenSunset Weekly Render & Upload
+run-name: GoldenSunset ${{ inputs.session_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_id:
+        description: 'Session ID'
+        required: true
+      audio_urls:
+        description: 'JSON array of audio URLs'
+        required: true
+      cover_image_url:
+        description: 'Cover image URL'
+        required: true
+      video_title:
+        description: 'YouTube video title'
+        required: true
+      youtube_description:
+        description: 'YouTube description'
+        required: true
+      youtube_tags:
+        description: 'Comma-separated tags'
+        required: true
+      track_titles:
+        description: 'JSON array of track titles (same order as audio_urls)'
+        required: false
+        default: '[]'
+      shorts_cover_url:
+        description: 'shorts.jpg Drive URL (optional, empty = Gemini ile portrait üret)'
+        required: false
+        default: ''
+      shorts_image_prompt:
+        description: 'Gemini için shorts görsel prompt (n8n den gelir)'
+        required: false
+        default: ''
+      shorts_title:
+        description: 'Optimized Shorts title (n8n GPT tarafından üretilir)'
+        required: false
+        default: ''
+      shorts_description:
+        description: 'Optimized Shorts description with hashtags (n8n GPT tarafından üretilir)'
+        required: false
+        default: ''
+
+      thumbnail_image_url:
+        description: 'Prevalidated thumbnail image URL'
+        required: true
+
+concurrency:
+  group: goldensunset-${{ inputs.session_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  render-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y ffmpeg python3-pip
+          pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib requests
+
+      - name: Save inputs to files
+        env:
+          AUDIO_URLS_JSON:    ${{ inputs.audio_urls }}
+          TRACK_TITLES_JSON:  ${{ inputs.track_titles }}
+          YT_DESCRIPTION_RAW: ${{ inputs.youtube_description }}
+        run: |
+          printf '%s' "$AUDIO_URLS_JSON"    > audio_urls.json
+          printf '%s' "$TRACK_TITLES_JSON"  > track_titles.json
+          printf '%s' "$YT_DESCRIPTION_RAW" > youtube_description.txt
+          echo "Input files saved."
+          echo "audio_urls.json: $(cat audio_urls.json)"
+          echo "track_titles.json: $(cat track_titles.json)"
+
+      - name: Download all audio files
+        env:
+          AUDIO_URLS_JSON: ${{ inputs.audio_urls }}
+        run: |
+          mkdir -p audio_files
+          python3 << 'EOF'
+          import json, requests, os
+
+          import re, time
+
+          urls = json.loads(os.environ["AUDIO_URLS_JSON"])
+          headers = {"User-Agent": "Mozilla/5.0 (compatible; MusicPipeline/1.0)"}
+
+          # KIE (Ekim 2026) artik sourceAudioUrl (cdn1.suno.ai) donmuyor; stream linkleri
+          # (audiostream.kie.ai) uretim bitince 403 veriyor. Ayni ID ile kalici adresleri dene.
+          def candidates(url):
+              m = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.mp3", url)
+              if not m:
+                  return [url]
+              sid = m.group(1)
+              c = [url,
+                   f"https://tempfile.aiquickdraw.com/r/{sid}.mp3",
+                   f"https://cdn1.suno.ai/{sid}.mp3"]
+              if "audiostream.kie.ai" in url:
+                  c = c[1:] + [url]
+              return list(dict.fromkeys(c))
+
+          print(f"Downloading {len(urls)} audio files...")
+          for i, url in enumerate(urls):
+              dest = f"audio_files/track_{i:04d}.mp3"
+              ok = False
+              for cand in candidates(url):
+                  for attempt in range(3):
+                      try:
+                          r = requests.get(cand, headers=headers, stream=True, timeout=120)
+                          r.raise_for_status()
+                          with open(dest, "wb") as f:
+                              for chunk in r.iter_content(chunk_size=8192):
+                                  f.write(chunk)
+                          if os.path.getsize(dest) > 100_000:
+                              ok = True
+                              break
+                      except Exception as e:
+                          print(f"   ! {cand} -> {e}")
+                          if "403" in str(e) or "404" in str(e):
+                              break
+                          time.sleep(5)
+                  if ok:
+                      print(f" [{i+1}/{len(urls)}] {dest} <- {cand}")
+                      break
+              if not ok:
+                  raise SystemExit(f"Track {i+1} indirilemedi: {url}")
+          EOF
+
+      - name: Download cover image
+        env:
+          COVER_IMAGE_URL: ${{ inputs.cover_image_url }}
+        run: |
+          python3 << 'EOF'
+          import urllib.request, os
+          urllib.request.urlretrieve(os.environ["COVER_IMAGE_URL"], "cover_raw.jpg")
+          print("Cover downloaded.")
+          EOF
+
+      - name: Prepare cover 1920x1080 (landscape)
+        run: |
+          ffmpeg -i cover_raw.jpg \
+            -vf "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,setsar=1" \
+            cover_hd.jpg
+
+      - name: Prepare Shorts cover portrait 1080x1920
+        env:
+          SHORTS_COVER_URL:    ${{ inputs.shorts_cover_url }}
+          SHORTS_IMAGE_PROMPT: ${{ inputs.shorts_image_prompt }}
+        run: |
+          python3 << 'EOF'
+          import os, requests, subprocess
+
+          shorts_url = os.environ.get("SHORTS_COVER_URL", "").strip()
+
+          if shorts_url:
+              print("Manuel shorts.jpg bulundu, indiriliyor...")
+              r = requests.get(shorts_url, timeout=60)
+              r.raise_for_status()
+              with open("shorts_raw.jpg", "wb") as f:
+                  f.write(r.content)
+              print("shorts.jpg indirildi.")
+              use_raw = "shorts_raw.jpg"
+          else:
+              raise RuntimeError("Prepared Shorts image required; paid image generation is disabled")
+
+          subprocess.run([
+              "ffmpeg", "-i", use_raw,
+              "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
+              "cover_portrait.jpg"
+          ], check=True)
+          print("cover_portrait.jpg hazir.")
+          EOF
+
+      - name: Build FFmpeg concat list
+        run: |
+          ls audio_files/track_*.mp3 | sort | while read f; do
+            echo "file '$f'"
+          done > concat_list.txt
+          cat concat_list.txt
+
+      - name: Concatenate all audio
+        run: |
+          ffmpeg -f concat -safe 0 -i concat_list.txt -c copy merged_audio.mp3
+          DURATION=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 merged_audio.mp3)
+          echo "Total duration: ${DURATION}s"
+          echo "AUDIO_DURATION=${DURATION}" >> $GITHUB_ENV
+
+      - name: Build tracklist & final description
+        run: |
+          python3 << 'EOF'
+          import json, subprocess, os
+
+          with open("audio_urls.json", "r") as f:
+              audio_urls = json.load(f)
+
+          with open("track_titles.json", "r") as f:
+              track_titles = json.load(f)
+
+          with open("youtube_description.txt", "r") as f:
+              base_desc = f.read()
+
+          durations = []
+          for i in range(len(audio_urls)):
+              path = f"audio_files/track_{i:04d}.mp3"
+              result = subprocess.run(
+                  ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                   "-of", "csv=p=0", path],
+                  capture_output=True, text=True
+              )
+              try:
+                  durations.append(float(result.stdout.strip()))
+              except (ValueError, TypeError):
+                  raise RuntimeError(f"Real duration missing for track {i+1}")
+              if durations[-1] <= 0:
+                  raise RuntimeError(f"Invalid duration for track {i+1}")
+
+          if len(track_titles) != len(audio_urls) or len(set(track_titles)) != len(track_titles):
+              raise RuntimeError("Track-title alignment or uniqueness check failed")
+
+          lines = []
+          cumulative = 0
+          for i, dur in enumerate(durations):
+              h = int(cumulative // 3600)
+              m = int((cumulative % 3600) // 60)
+              s = int(cumulative % 60)
+              timestamp = f"{h:02d}:{m:02d}:{s:02d}"
+              title = track_titles[i] if track_titles and i < len(track_titles) else f"Track {i+1}"
+              lines.append(f"{timestamp} {title}")
+              cumulative += dur
+
+          tracklist = "\n".join(lines)
+          final_desc = base_desc.strip() + "\n\n🎶 Tracklist:\n" + tracklist
+          if len(final_desc) > 5000:
+              raise RuntimeError("Final YouTube description exceeds 5000 characters")
+
+          with open("final_description.txt", "w") as f:
+              f.write(final_desc)
+
+          print("=== TRACKLIST ===")
+          print(tracklist)
+          print("=== FINAL DESCRIPTION ===")
+          print(final_desc[:500])
+          EOF
+
+      - name: Render video (landscape)
+        run: |
+          ffmpeg \
+            -loop 1 -framerate 1 -i cover_hd.jpg \
+            -i merged_audio.mp3 \
+            -c:v libx264 -tune stillimage -preset slow \
+            -c:a aac -b:a 192k \
+            -pix_fmt yuv420p \
+            -t "${{ env.AUDIO_DURATION }}" \
+            -movflags +faststart \
+            output.mp4
+          ls -lh output.mp4
+
+      - name: Render Shorts video (portrait, 59s + Ken Burns)
+        run: |
+          python3 << 'EOF'
+          import subprocess, os
+
+          fps = 25
+          duration = 59
+          total_frames = fps * duration  # 1475
+
+          zoom_expr  = f"'min(1+on/{total_frames}*0.08,1.08)'"
+          pan_x_expr = f"'iw/2-(iw/zoom/2)+on/{total_frames}*20'"
+          pan_y_expr = "'ih/2-(ih/zoom/2)'"
+
+          vf = (
+              f"[0:v]scale=2160:3840,"
+              f"zoompan=z={zoom_expr}:x={pan_x_expr}:y={pan_y_expr}"
+              f":d={total_frames}:s=1080x1920:fps={fps}[v]"
+          )
+
+          print("Ken Burns Shorts render basliyor...")
+          subprocess.run([
+              "ffmpeg",
+              "-loop", "1", "-framerate", str(fps), "-i", "cover_portrait.jpg",
+              "-i", "merged_audio.mp3",
+              "-filter_complex", vf,
+              "-map", "[v]", "-map", "1:a",
+              "-c:v", "libx264", "-preset", "slow",
+              "-c:a", "aac", "-b:a", "192k",
+              "-pix_fmt", "yuv420p",
+              "-t", "59",
+              "-movflags", "+faststart",
+              "output_shorts.mp4"
+          ], check=True)
+
+          size = os.path.getsize("output_shorts.mp4")
+          print(f"output_shorts.mp4 hazir: {size/1024/1024:.1f} MB")
+          EOF
+
+      - name: Upload to YouTube (long form)
+        id: youtube_upload
+        env:
+          YT_CLIENT_ID:     ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          YT_TITLE:         ${{ inputs.video_title }}
+          YT_TAGS:          ${{ inputs.youtube_tags }}
+          THUMBNAIL_URL:    ${{ inputs.thumbnail_image_url }}
+        run: |
+          python3 << 'EOF'
+          import os, json, requests
+
+          r = requests.post("https://oauth2.googleapis.com/token", data={
+              "client_id":     os.environ["YT_CLIENT_ID"],
+              "client_secret": os.environ["YT_CLIENT_SECRET"],
+              "refresh_token": os.environ["YT_REFRESH_TOKEN"],
+              "grant_type":    "refresh_token"
+          })
+          resp_data = r.json()
+          r.raise_for_status()
+          if "access_token" not in resp_data:
+              raise RuntimeError("YouTube OAuth token exchange failed")
+          access_token = resp_data["access_token"]
+
+          with open("final_description.txt", "r") as f:
+              description = f.read()
+
+          meta = {
+              "snippet": {
+                  "title":       os.environ["YT_TITLE"],
+                  "description": description,
+                  "tags":        [t.strip() for t in os.environ["YT_TAGS"].split(",")],
+                  "categoryId":  "10"
+              },
+              "status": {"privacyStatus": "unlisted", "containsSyntheticMedia": True}
+          }
+
+          init = requests.post(
+              "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
+              headers={
+                  "Authorization": f"Bearer {access_token}",
+                  "Content-Type":  "application/json; charset=UTF-8",
+                  "X-Upload-Content-Type": "video/mp4"
+              },
+              data=json.dumps(meta)
+          )
+          upload_url = init.headers["Location"]
+
+          file_size  = os.path.getsize("output.mp4")
+          chunk_size = 50 * 1024 * 1024
+          uploaded   = 0
+
+          with open("output.mp4", "rb") as f:
+              while uploaded < file_size:
+                  chunk = f.read(chunk_size)
+                  end   = uploaded + len(chunk) - 1
+                  resp  = requests.put(
+                      upload_url,
+                      headers={
+                          "Authorization": f"Bearer {access_token}",
+                          "Content-Range": f"bytes {uploaded}-{end}/{file_size}",
+                          "Content-Type":  "video/mp4"
+                      },
+                      data=chunk
+                  )
+                  uploaded += len(chunk)
+                  print(f"Uploaded {uploaded}/{file_size} ({100*uploaded//file_size}%)")
+
+          resp.raise_for_status()
+          video_id = resp.json().get("id", "unknown")
+          if video_id == "unknown":
+              raise RuntimeError("YouTube long video ID missing")
+          print(f"Done! https://youtube.com/watch?v={video_id}")
+
+          gh_output = os.environ.get("GITHUB_OUTPUT", "")
+          if gh_output:
+              with open(gh_output, "a") as fh:
+                  fh.write(f"video_id={video_id}\n")
+          EOF
+
+      - name: Apply prepared thumbnail
+        env:
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          VIDEO_ID: ${{ steps.youtube_upload.outputs.video_id }}
+          THUMBNAIL_URL: ${{ inputs.thumbnail_image_url }}
+        run: |
+          python3 << 'EOF'
+          import os, requests
+          token_response = requests.post("https://oauth2.googleapis.com/token", data={
+              "client_id": os.environ["YT_CLIENT_ID"],
+              "client_secret": os.environ["YT_CLIENT_SECRET"],
+              "refresh_token": os.environ["YT_REFRESH_TOKEN"],
+              "grant_type": "refresh_token"
+          }, timeout=60)
+          token_response.raise_for_status()
+          token = token_response.json()["access_token"]
+          image = requests.get(os.environ["THUMBNAIL_URL"], timeout=60)
+          image.raise_for_status()
+          if len(image.content) > 2_000_000:
+              raise RuntimeError("Thumbnail exceeds 2 MB")
+          result = requests.post(
+              "https://www.googleapis.com/upload/youtube/v3/thumbnails/set",
+              params={"videoId": os.environ["VIDEO_ID"], "uploadType": "media"},
+              headers={"Authorization": f"Bearer {token}", "Content-Type": "image/jpeg"},
+              data=image.content, timeout=120)
+          result.raise_for_status()
+          print("Prepared thumbnail applied.")
+          EOF
+
+      - name: Upload to YouTube (Shorts)
+        id: shorts_upload
+        env:
+          YT_CLIENT_ID:       ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET:   ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN:   ${{ secrets.YT_REFRESH_TOKEN }}
+          YT_TITLE:           ${{ inputs.video_title }}
+          YT_TAGS:            ${{ inputs.youtube_tags }}
+          SHORTS_TITLE:       ${{ inputs.shorts_title }}
+          SHORTS_DESCRIPTION: ${{ inputs.shorts_description }}
+          MAIN_VIDEO_ID:      ${{ steps.youtube_upload.outputs.video_id }}
+        run: |
+          python3 << 'EOF'
+          import os, json, requests
+
+          r = requests.post("https://oauth2.googleapis.com/token", data={
+              "client_id":     os.environ["YT_CLIENT_ID"],
+              "client_secret": os.environ["YT_CLIENT_SECRET"],
+              "refresh_token": os.environ["YT_REFRESH_TOKEN"],
+              "grant_type":    "refresh_token"
+          })
+          resp_data = r.json()
+          r.raise_for_status()
+          if "access_token" not in resp_data:
+              raise RuntimeError("YouTube OAuth token exchange failed")
+          access_token = resp_data["access_token"]
+
+          base_title    = os.environ["YT_TITLE"]
+          main_video_id = os.environ.get("MAIN_VIDEO_ID", "")
+
+          shorts_title_input = os.environ.get("SHORTS_TITLE", "").strip()
+          short_title = shorts_title_input if shorts_title_input else base_title[:70] + " #Shorts"
+
+          shorts_desc_input = os.environ.get("SHORTS_DESCRIPTION", "").strip()
+          full_video_line = (
+              f"\n\n\U0001f3ac Full version: https://youtube.com/watch?v={main_video_id}"
+              if main_video_id and main_video_id != "unknown" else ""
+          )
+
+          if shorts_desc_input:
+              short_desc = shorts_desc_input + full_video_line + "\n\n\U0001f514 More music: @GoldenSunsetLoungeVibes"
+          else:
+              short_desc = (
+                  f"\U0001f3b5 {base_title}\n\n"
+                  "Relax, focus, and let the music flow. \u2728"
+                  f"{full_video_line}\n\n"
+                  "\U0001f514 More music: @GoldenSunsetLoungeVibes\n\n"
+                  "#Shorts #RelaxingMusic #ChillVibes #LoFi #AmbientMusic"
+              )
+
+          tags = [t.strip() for t in os.environ["YT_TAGS"].split(",")]
+          tags = list(dict.fromkeys(tags + ["Shorts", "YouTube Shorts", "Relaxing Music Short"]))
+
+          meta = {
+              "snippet": {
+                  "title":       short_title,
+                  "description": short_desc,
+                  "tags":        tags,
+                  "categoryId":  "10"
+              },
+              "status": {"privacyStatus": "unlisted", "containsSyntheticMedia": True}
+          }
+
+          init = requests.post(
+              "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
+              headers={
+                  "Authorization": f"Bearer {access_token}",
+                  "Content-Type":  "application/json; charset=UTF-8",
+                  "X-Upload-Content-Type": "video/mp4"
+              },
+              data=json.dumps(meta)
+          )
+          upload_url = init.headers["Location"]
+
+          file_size  = os.path.getsize("output_shorts.mp4")
+          chunk_size = 50 * 1024 * 1024
+          uploaded   = 0
+
+          with open("output_shorts.mp4", "rb") as f:
+              while uploaded < file_size:
+                  chunk = f.read(chunk_size)
+                  end   = uploaded + len(chunk) - 1
+                  resp  = requests.put(
+                      upload_url,
+                      headers={
+                          "Authorization": f"Bearer {access_token}",
+                          "Content-Range": f"bytes {uploaded}-{end}/{file_size}",
+                          "Content-Type":  "video/mp4"
+                      },
+                      data=chunk
+                  )
+                  uploaded += len(chunk)
+                  print(f"Shorts {uploaded}/{file_size} ({100*uploaded//file_size}%)")
+
+          resp.raise_for_status()
+          shorts_id = resp.json().get("id", "unknown")
+          if shorts_id == "unknown":
+              raise RuntimeError("YouTube Shorts ID missing")
+          print(f"Shorts done! https://youtube.com/shorts/{shorts_id}")
+
+          gh_output = os.environ.get("GITHUB_OUTPUT", "")
+          if gh_output:
+              with open(gh_output, "a") as fh:
+                  fh.write(f"shorts_id={shorts_id}\n")
+          EOF
+
+      - name: Notify n8n — YouTube Complete
+        if: always()
+        env:
+          SESSION_ID: ${{ inputs.session_id }}
+          N8N_KEY:    ${{ secrets.N8N_KEY }}
+        run: |
+          VIDEO_ID="${{ steps.youtube_upload.outputs.video_id }}"
+          SHORTS_ID="${{ steps.shorts_upload.outputs.shorts_id }}"
+          echo "VIDEO_ID: $VIDEO_ID"
+          echo "SHORTS_ID: $SHORTS_ID"
+          if [ -n "$VIDEO_ID" ] && [ "$VIDEO_ID" != "unknown" ] && [ -n "$SHORTS_ID" ] && [ "$SHORTS_ID" != "unknown" ]; then
+            STATUS="completed"
+          else
+            STATUS="failed"
+          fi
+          if [ -n "$SESSION_ID" ]; then
+            curl --fail-with-body --silent --show-error -X POST "https://n8n.unicoats.com/webhook/goldensunset-weekly-v1-complete" \
+              --connect-timeout 30 \
+              --max-time 120 \
+              --retry 3 \
+              --retry-delay 10 \
+              --retry-all-errors \
+              -H "Content-Type: application/json" \
+              -H "X-N8N-KEY: $N8N_KEY" \
+              -d "$(jq -nc --arg s "$SESSION_ID" --arg v "$VIDEO_ID" --arg h "$SHORTS_ID" --arg t "$STATUS" '{session_id:$s, youtube_id:$v, shorts_id:$h, status:$t}')"
+            echo "n8n callback gonderildi."
+          else
+            echo "Session ID missing; callback skipped."
+            exit 1
+          fi
