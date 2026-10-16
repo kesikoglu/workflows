@@ -249,18 +249,46 @@ jobs:
           print(final_desc[:500])
           EOF
 
-      - name: Render video (landscape)
+      - name: Render video (landscape, seamless micro animation)
+        env:
+          AUDIO_DURATION: ${{ env.AUDIO_DURATION }}
         run: |
-          ffmpeg \
-            -loop 1 -framerate 1 -i cover_hd.jpg \
-            -i merged_audio.mp3 \
-            -c:v libx264 -tune stillimage -preset slow \
-            -c:a aac -b:a 192k \
-            -pix_fmt yuv420p \
-            -t "${{ env.AUDIO_DURATION }}" \
-            -movflags +faststart \
-            output.mp4
-          ls -lh output.mp4
+          python3 << 'EOF'
+          import math, os, subprocess
+
+          duration = float(os.environ['AUDIO_DURATION'])
+          if not math.isfinite(duration) or duration <= 0:
+              raise RuntimeError('Valid audio duration required')
+          fps = 25
+          loop_seconds = 60
+          frames = fps * loop_seconds
+          # Periodic expressions join naturally at the loop boundary.
+          # Small zoom (3.5%-6.5%) leaves a crop margin for the gentle pan.
+          phase = f'2*PI*on/{frames}'
+          zoom = f'1.035+0.015*(1-cos({phase}))'
+          pan_x = f'(iw-iw/zoom)*(0.5+0.15*sin({phase}))'
+          pan_y = '(ih-ih/zoom)/2'
+          vf = (
+              'scale=3840:2160,'
+              f"zoompan=z='{zoom}':x='{pan_x}':y='{pan_y}'"
+              f':d={frames}:s=1920x1080:fps={fps},setsar=1'
+          )
+          # Encode the moving picture once, then repeat without re-encoding.
+          subprocess.run([
+              'ffmpeg', '-y', '-i', 'cover_hd.jpg', '-vf', vf,
+              '-frames:v', str(frames), '-an',
+              '-c:v', 'libx264', '-preset', 'medium', '-crf', '20',
+              '-pix_fmt', 'yuv420p', '-video_track_timescale', '25000',
+              '-movflags', '+faststart', 'motion_loop.mp4'
+          ], check=True)
+          subprocess.run([
+              'ffmpeg', '-y', '-stream_loop', '-1', '-i', 'motion_loop.mp4',
+              '-i', 'merged_audio.mp3', '-map', '0:v:0', '-map', '1:a:0',
+              '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+              '-t', str(duration), '-movflags', '+faststart', 'output.mp4'
+          ], check=True)
+          print(f'Animated landscape ready: {duration:.2f}s, 1920x1080, {fps}fps')
+          EOF
 
       - name: Render Shorts video (portrait, 59s + Ken Burns)
         run: |
@@ -548,3 +576,4 @@ jobs:
             echo "Session ID missing; callback skipped."
             exit 1
           fi
+
